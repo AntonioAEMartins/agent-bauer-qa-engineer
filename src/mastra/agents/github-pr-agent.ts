@@ -2,6 +2,7 @@ import { Agent } from "@mastra/core";
 import { dockerExecTool } from "../tools/docker-exec-tool";
 import { cliTool } from "../tools/cli-tool";
 import { openai } from "@ai-sdk/openai";
+import { groq } from "@ai-sdk/groq";
 
 export const githubPrAgent = new Agent({
     id: "githubPrAgent",
@@ -31,10 +32,12 @@ BEST PRACTICES:
 - Keep messages short but specific; include scope if appropriate.
 - Validate remote origin and parse owner/repo for upstream details.
 - Verify commands succeeded (e.g., list files, show status).`,
-    model: openai("gpt-5-nano", {
-        parallelToolCalls: true,
-        reasoningEffort: "medium",
-    }),
+    // model: openai("gpt-5-nano", {
+    //     parallelToolCalls: true,
+    //     reasoningEffort: "medium",
+    // }),
+    model: groq('openai/gpt-oss-120b'),
+
     tools: {
         docker_exec: dockerExecTool,
         exec_command: cliTool,

@@ -2,6 +2,7 @@ import { Agent } from "@mastra/core";
 import { dockerExecTool } from "../tools/docker-exec-tool";
 import { cliTool } from "../tools/cli-tool";
 import { openai } from "@ai-sdk/openai";
+import { groq } from "@ai-sdk/groq";
 
 export const codebaseDescriptionAgent = new Agent({
     id: "codebaseDescriptionAgent",
@@ -27,10 +28,11 @@ OUTPUT STYLE:
 RETURN FORMAT:
 When asked, return STRICT JSON with keys: {"description": string, "sources": string[], "confidence": number, "notes": string}. No extra text.
 `,
-    model: openai("gpt-5-nano", {
-        parallelToolCalls: true,
-        reasoningEffort: "medium",
-    }),
+    // model: openai("gpt-5-nano", {
+    //     parallelToolCalls: true,
+    //     reasoningEffort: "medium",
+    // }),
+    model: groq('openai/gpt-oss-120b'),
     tools: {
         docker_exec: dockerExecTool,
         exec_command: cliTool,

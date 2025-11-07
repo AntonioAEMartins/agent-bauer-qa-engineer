@@ -4,6 +4,7 @@ import { dockerExecTool } from "../tools/docker-exec-tool";
 import { codeAnalysisTool } from "../tools/code-analysis-tool";
 import { fileOperationsTool } from "../tools/file-operations-tool";
 import { openai } from "@ai-sdk/openai";
+import { groq } from "@ai-sdk/groq";
 
 export const unitTestAgent = new Agent({
     id: "unitTestAgent", 
@@ -31,10 +32,12 @@ REQUIREMENTS:
 - Return JSON responses when requested
 
 Keep it simple and functional. Focus on creating working test files quickly.`,
-    model: openai("gpt-5-mini", {
-        parallelToolCalls: true,
-        reasoningEffort: "low", // Changed from "high" to "low" for MVP validation
-    }),
+    // model: openai("gpt-5-mini", {
+    //     parallelToolCalls: true,
+    //     reasoningEffort: "low", // Changed from "high" to "low" for MVP validation
+    // }),
+    model: groq('openai/gpt-oss-120b'),
+
     tools: {
         exec_command: cliTool,
         docker_exec: dockerExecTool,

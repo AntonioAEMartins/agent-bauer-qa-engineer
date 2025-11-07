@@ -6,6 +6,7 @@ import { coverageRunnerTool } from "../tools/coverage-runner-tool";
 import { coverageParseTool } from "../tools/coverage-parse-tool";
 import { cliTool } from "../tools/cli-tool";
 import { openai } from "@ai-sdk/openai";
+import { groq } from "@ai-sdk/groq";
 
 export const typescriptVitestCoverageAgent = new Agent({
     id: "typescriptVitestCoverageAgent",
@@ -137,10 +138,12 @@ UNIVERSAL PATH DISCOVERY STRATEGY:
 
 BE METHODICAL AND THOROUGH. Return ONLY JSON - no markdown formatting or explanations.
 `,
-    model: openai("gpt-5", {
-        parallelToolCalls: true,
-        reasoningEffort: "medium",
-    }),
+    // model: openai("gpt-5", {
+    //     parallelToolCalls: true,
+    //     reasoningEffort: "medium",
+    // }),
+    model: groq('openai/gpt-oss-120b'),
+
     tools: {
         docker_exec: dockerExecTool,
         file_operations: fileOperationsTool,

@@ -2,6 +2,7 @@ import { Agent } from "@mastra/core";
 import { cliTool } from "../tools/cli-tool";
 import { dockerExecTool } from "../tools/docker-exec-tool";
 import { openai } from "@ai-sdk/openai";
+import { groq } from "@ai-sdk/groq";
 
 export const testSpecificationAgent = new Agent({
     id: "testSpecificationAgent",
@@ -41,10 +42,12 @@ OUTPUT REQUIREMENTS:
 - Estimated complexity and effort
 
 Focus on creating thorough, well-organized test specifications that ensure complete coverage.`,
-    model: openai("gpt-5-mini", {
-        parallelToolCalls: true,
-        reasoningEffort: "high",
-    }),
+    // model: openai("gpt-5-mini", {
+    //     parallelToolCalls: true,
+    //     reasoningEffort: "high",
+    // }),
+    model: groq('openai/gpt-oss-120b'),
+
     tools: {
         exec_command: cliTool,
         docker_exec: dockerExecTool,

@@ -3,6 +3,7 @@ import { cliTool } from "../tools/cli-tool";
 import { dockerExecTool } from "../tools/docker-exec-tool";
 import { fileOperationsTool } from "../tools/file-operations-tool";
 import { openai } from "@ai-sdk/openai";
+import { groq } from "@ai-sdk/groq";
 
 export const testGenerationAgent = new Agent({
     id: "testGenerationAgent",
@@ -46,10 +47,12 @@ OUTPUT REQUIREMENTS:
 - Include test count and coverage information
 
 Focus on generating production-ready test code that actually validates business logic.`,
-    model: openai("gpt-5-mini", {
-        parallelToolCalls: true,
-        reasoningEffort: "high",
-    }),
+    // model: openai("gpt-5-mini", {
+    //     parallelToolCalls: true,
+    //     reasoningEffort: "high",
+    // }),
+    model: groq('openai/gpt-oss-120b'),
+
     tools: {
         exec_command: cliTool,
         docker_exec: dockerExecTool,

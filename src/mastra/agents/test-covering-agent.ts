@@ -6,6 +6,7 @@ import { coverageRunnerTool } from "../tools/coverage-runner-tool";
 import { coverageParseTool } from "../tools/coverage-parse-tool";
 import { cliTool } from "../tools/cli-tool";
 import { openai } from "@ai-sdk/openai";
+import { groq } from "@ai-sdk/groq";
 
 export const testCoveringAgent = new Agent({
     id: "testCoveringAgent",
@@ -32,10 +33,12 @@ You must:
 - Prefer coverage files over stdout parsing
 - Return JSON shape: { "repoPath": string, "language": string, "framework": string, "coverage": number }
 `,
-    model: openai("gpt-5-mini", {
-        parallelToolCalls: true,
-        reasoningEffort: "low",
-    }),
+    // model: openai("gpt-5-mini", {
+    //     parallelToolCalls: true,
+    //     reasoningEffort: "low",
+    // }),
+    model: groq('openai/gpt-oss-120b'),
+
     tools: {
         coverage_detection: coverageDetectionTool,
         coverage_runner: coverageRunnerTool,

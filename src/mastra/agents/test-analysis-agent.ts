@@ -3,6 +3,7 @@ import { cliTool } from "../tools/cli-tool";
 import { dockerExecTool } from "../tools/docker-exec-tool";
 import { codeAnalysisTool } from "../tools/code-analysis-tool";
 import { openai } from "@ai-sdk/openai";
+import { groq } from "@ai-sdk/groq";
 
 export const testAnalysisAgent = new Agent({
     id: "testAnalysisAgent",
@@ -31,10 +32,12 @@ OUTPUT REQUIREMENTS:
 - Flag potential testing challenges and edge cases
 
 Be precise, thorough, and focus only on analysis - no test generation.`,
-    model: openai("gpt-5-mini", {
-        parallelToolCalls: true,
-        reasoningEffort: "high",
-    }),
+    // model: openai("gpt-5-mini", {
+    //     parallelToolCalls: true,
+    //     reasoningEffort: "high",
+    // }),
+    model: groq('openai/gpt-oss-120b'),
+
     tools: {
         exec_command: cliTool,
         docker_exec: dockerExecTool,
