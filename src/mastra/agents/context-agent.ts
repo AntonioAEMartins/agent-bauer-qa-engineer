@@ -9,11 +9,11 @@ export const contextAgent = new Agent({
     name: "Context Agent",
     instructions:
         "You specialize in analyzing source code repositories and synthesizing structured RepoContext. Always be cautious and non-destructive. Prefer reasoning over assumptions, cite uncertainties with low confidence. When asked to return JSON, output strictly JSON with no extra commentary.",
-    // model: openai("gpt-5-mini", {
-    //     parallelToolCalls: true,
-    //     reasoningEffort: "high",
-    // }),
-    model: groq('openai/gpt-oss-120b'),
+    model: openai("gpt-5.1", {
+        parallelToolCalls: true,
+        reasoningEffort: "high",
+    }),
+    // model: groq('openai/gpt-oss-120b'),
     tools: {
         exec_command: cliTool,
         docker_exec: dockerExecTool,

@@ -2,26 +2,39 @@ import { createTool } from "@mastra/core";
 import z from "zod";
 import { cliToolMetrics } from "./cli-tool";
 
+const inputSchema = z.object({
+    containerId: z.string().describe("Docker container ID to run analysis in"),
+    filePath: z.string().describe("Path to the source code file to analyze"),
+    analysisType: z.enum(["structure", "functions", "dependencies", "exports", "full"]).describe("Type of analysis to perform"),
+    language: z.string().optional().describe("Programming language (auto-detected if not provided)"),
+});
+
+const analysisResultSchema = z.object({
+    command: z.string(),
+    output: z.string(),
+    error: z.string().optional(),
+});
+
+const outputSchema = z.object({
+    filePath: z.string(),
+    analysisType: z.string(),
+    language: z.string(),
+    fileExists: z.boolean(),
+    results: z.array(analysisResultSchema),
+    timestamp: z.string(),
+});
+
+type CodeAnalysisInput = z.infer<typeof inputSchema>;
+type CodeAnalysisOutput = z.infer<typeof outputSchema>;
+type AnalysisResult = z.infer<typeof analysisResultSchema>;
+
 export const codeAnalysisTool = createTool({
     id: "code_analysis",
     description: "Perform deep analysis of source code files to extract structure, functions, classes, and testing requirements",
-    inputSchema: z.object({
-        containerId: z.string().describe("Docker container ID to run analysis in"),
-        filePath: z.string().describe("Path to the source code file to analyze"),
-        analysisType: z.enum(["structure", "functions", "dependencies", "exports", "full"]).describe("Type of analysis to perform"),
-        language: z.string().optional().describe("Programming language (auto-detected if not provided)"),
-    }),
-    execute: async ({ context }) => {
-        const { containerId, filePath, analysisType, language } = context;
-        if (!containerId || typeof containerId !== "string") {
-            throw new Error("containerId is required and must be a string");
-        }
-        if (!filePath || typeof filePath !== "string") {
-            throw new Error("filePath is required and must be a string");
-        }
-        if (!analysisType) {
-            throw new Error("analysisType is required");
-        }
+    inputSchema,
+    outputSchema,
+    execute: async ({ context }): Promise<CodeAnalysisOutput> => {
+        const { containerId, filePath, analysisType, language } = context as CodeAnalysisInput;
 
         // Count every tool invocation
         cliToolMetrics.callCount += 1;
@@ -29,7 +42,7 @@ export const codeAnalysisTool = createTool({
         const { exec } = await import("child_process");
 
         // Build analysis commands based on type
-        let commands = [];
+        const commands: string[] = [];
         
         // Check if file exists first
         commands.push(`docker exec ${containerId} bash -lc "test -f ${filePath} && echo 'FILE_EXISTS' || echo 'FILE_NOT_FOUND'"`);
@@ -67,14 +80,17 @@ export const codeAnalysisTool = createTool({
         }
 
         // Execute all commands and collect results
-        const results = [];
-        for (const cmd of commands) {
+        const results: AnalysisResult[] = [];
+        let fileExists = false;
+
+        for (let i = 0; i < commands.length; i++) {
+            const cmd = commands[i];
             try {
                 const result = await new Promise<string>((resolve, reject) => {
                     exec(cmd, (error, stdout, stderr) => {
                         if (error) {
                             // Don't reject for grep not finding patterns
-                            if (cmd.includes('grep') && error.code === 1) {
+                            if (cmd.includes('grep') && (error as NodeJS.ErrnoException).code === '1') {
                                 resolve("");
                             } else {
                                 reject(new Error(stderr || error.message));
@@ -84,26 +100,32 @@ export const codeAnalysisTool = createTool({
                         }
                     });
                 });
-                results.push({ command: cmd, output: result.trim() });
+                
+                // First command checks file existence
+                if (i === 0) {
+                    fileExists = result.trim() === "FILE_EXISTS";
+                } else {
+                    results.push({ command: cmd, output: result.trim() });
+                }
             } catch (error) {
-                results.push({ 
-                    command: cmd, 
-                    output: "", 
-                    error: error instanceof Error ? error.message : 'Unknown error' 
-                });
+                if (i > 0) {
+                    results.push({ 
+                        command: cmd, 
+                        output: "", 
+                        error: error instanceof Error ? error.message : 'Unknown error' 
+                    });
+                }
             }
         }
 
         // Structure the results
-        const analysisResult = {
+        return {
             filePath,
             analysisType,
             language: language || "auto-detected",
-            fileExists: results[0]?.output === "FILE_EXISTS",
-            results: results.slice(1), // Skip the file existence check
+            fileExists,
+            results,
             timestamp: new Date().toISOString(),
         };
-
-        return analysisResult;
     },
 });

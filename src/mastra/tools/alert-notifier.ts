@@ -27,7 +27,7 @@ export const AlertEventSchema = z.object({
     containerId: z.string().optional(),
     contextPath: z.string().optional(),
     toolCallCount: z.number().optional(),
-    metadata: z.record(z.any()).optional(),
+    metadata: z.record(z.unknown()).optional(),
 
     // Event time
     timestamp: z.string().datetime().optional(),

@@ -33,11 +33,11 @@ You must:
 - Prefer coverage files over stdout parsing
 - Return JSON shape: { "repoPath": string, "language": string, "framework": string, "coverage": number }
 `,
-    // model: openai("gpt-5-mini", {
-    //     parallelToolCalls: true,
-    //     reasoningEffort: "low",
-    // }),
-    model: groq('openai/gpt-oss-120b'),
+    model: openai("gpt-5.1", {
+        parallelToolCalls: true,
+        reasoningEffort: "low",
+    }),
+    // model: groq('openai/gpt-oss-120b'),
 
     tools: {
         coverage_detection: coverageDetectionTool,

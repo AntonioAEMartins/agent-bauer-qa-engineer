@@ -7,26 +7,154 @@ import { existsSync, writeFileSync, unlinkSync, mkdtempSync, readFileSync } from
 import path from "path";
 import os from "os";
 import { notifyStepStatus } from "../../tools/alert-notifier";
+import { 
+    ContextDataSchema, 
+    type ContextData,
+    getErrorMessage,
+} from "../../types";
 
 const ALERTS_ONLY = (process.env.ALERTS_ONLY === 'true') || (process.env.LOG_MODE === 'alerts_only') || (process.env.MASTRA_LOG_MODE === 'alerts_only');
 
+// =============================================================================
+// STEP INPUT/OUTPUT SCHEMAS
+// =============================================================================
+
+const TestDockerStepInputSchema = z.object({
+    contextData: ContextDataSchema.optional().describe("Optional context data to pass through"),
+    repositoryUrl: z.string().optional().describe("Optional repository URL or owner/repo format (e.g., 'owner/repo' or 'https://github.com/owner/repo')"),
+    projectId: z.string().describe("Project ID associated with this workflow run"),
+});
+
+const TestDockerStepOutputSchema = z.object({
+    result: z.string().describe("The result of the Docker operation"),
+    success: z.boolean().describe("Whether the operation was successful"),
+    toolCallCount: z.number().describe("Total number of tool calls made during execution"),
+    containerId: z.string().describe("The ID of the created Docker container"),
+    contextData: ContextDataSchema.optional().describe("Context data passed through"),
+    repositoryUrl: z.string().optional().describe("Repository URL passed through"),
+    projectId: z.string().describe("Project ID passed through"),
+});
+
+const TestDockerGithubCloneStepOutputSchema = TestDockerStepOutputSchema.extend({
+    repoPath: z.string().describe("Absolute path to the cloned repository inside the container"),
+});
+
+const PostProjectStepInputSchema = TestDockerGithubCloneStepOutputSchema;
+const PostProjectStepOutputSchema = TestDockerGithubCloneStepOutputSchema;
+
+const ParallelPostProjectOutputSchema = z.object({
+    "post-project-description-step": PostProjectStepOutputSchema,
+    "post-project-stack-step": PostProjectStepOutputSchema,
+});
+
+const DockerSaveContextStepOutputSchema = z.object({
+    result: z.string().describe("The result of the Docker operation"),
+    success: z.boolean().describe("Whether the operation was successful"),
+    toolCallCount: z.number().describe("Total number of tool calls made during execution"),
+    containerId: z.string().describe("The ID of the created Docker container"),
+    contextPath: z.string().describe("Path where context was saved in the container"),
+    repoPath: z.string().describe("Absolute path to the cloned repository inside the container"),
+    projectId: z.string().describe("Project ID passed through"),
+});
+
+// Type aliases for convenience
+type TestDockerStepInput = z.infer<typeof TestDockerStepInputSchema>;
+type TestDockerStepOutput = z.infer<typeof TestDockerStepOutputSchema>;
+type TestDockerGithubCloneStepOutput = z.infer<typeof TestDockerGithubCloneStepOutputSchema>;
+type PostProjectStepInput = z.infer<typeof PostProjectStepInputSchema>;
+type PostProjectStepOutput = z.infer<typeof PostProjectStepOutputSchema>;
+type ParallelPostProjectOutput = z.infer<typeof ParallelPostProjectOutputSchema>;
+type DockerSaveContextStepOutput = z.infer<typeof DockerSaveContextStepOutputSchema>;
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+function sh(cmd: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+        exec(cmd, (error, stdout, stderr) => {
+            if (error) {
+                reject(new Error(stderr || error.message));
+            } else {
+                resolve(stdout);
+            }
+        });
+    });
+}
+
+function extractRepoCoordinates(
+    repositoryUrl: string | undefined,
+    contextData: ContextData | undefined
+): { owner: string | undefined; repo: string | undefined; resolvedRepoPath: string } {
+    let repoOwner: string | undefined;
+    let repoName: string | undefined;
+    let resolvedRepoPath: string;
+
+    if (repositoryUrl) {
+        const repoUrl = repositoryUrl.trim();
+        
+        if (repoUrl.includes('github.com/')) {
+            const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
+            if (match) {
+                repoOwner = match[1];
+                repoName = match[2];
+                resolvedRepoPath = `${repoOwner}/${repoName}`;
+            } else {
+                throw new Error(`Invalid GitHub URL format: ${repoUrl}`);
+            }
+        } else if (repoUrl.includes('/') && !repoUrl.includes(' ')) {
+            const [ownerPart, repoPart] = repoUrl.split('/');
+            if (ownerPart && repoPart) {
+                repoOwner = ownerPart;
+                repoName = repoPart;
+                resolvedRepoPath = repoUrl;
+            } else {
+                throw new Error(`Invalid repository format: ${repoUrl}. Expected format: "owner/repo"`);
+            }
+        } else {
+            throw new Error(`Invalid repository format: ${repoUrl}. Expected format: "owner/repo" or GitHub URL`);
+        }
+    } else {
+        // Fall back to contextData extraction
+        const context = contextData || {};
+        repoOwner = typeof context.owner === 'string' ? context.owner : undefined;
+        repoName = typeof context.repo === 'string' ? context.repo : undefined;
+        const fullName = typeof context.fullName === 'string' ? context.fullName : (typeof context.full_name === 'string' ? context.full_name : undefined);
+        if ((!repoOwner || !repoName) && fullName && fullName.includes('/')) {
+            const [ownerPart, repoPart] = fullName.split('/');
+            repoOwner = repoOwner || ownerPart;
+            repoName = repoName || repoPart;
+        }
+        resolvedRepoPath = (repoOwner && repoName) ? `${repoOwner}/${repoName}` : 'AntonioAEMartins/yc-24h-hackathon-agent';
+    }
+
+    return { owner: repoOwner, repo: repoName, resolvedRepoPath };
+}
+
+function getCredToken(): string | undefined {
+    try {
+        const cwd = process.cwd();
+        const primaryPath = path.resolve(cwd, '.docker.credentials');
+        const fallbackPath = path.resolve(cwd, '..', '..', '.docker.credentials');
+        const credPath = existsSync(primaryPath) ? primaryPath : (existsSync(fallbackPath) ? fallbackPath : undefined);
+        if (!credPath) return undefined;
+        const raw = readFileSync(credPath, 'utf8');
+        const m = raw.match(/GITHUB_PAT\s*=\s*(.+)/);
+        return m ? m[1].trim() : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+// =============================================================================
+// STEP 1: TEST DOCKER STEP
+// =============================================================================
+
 export const testDockerStep = createStep({
     id: "test-docker-step",
-    inputSchema: z.object({
-        contextData: z.any().optional().describe("Optional context data to pass through"),
-        repositoryUrl: z.string().optional().describe("Optional repository URL or owner/repo format (e.g., 'owner/repo' or 'https://github.com/owner/repo')"),
-        projectId: z.string().describe("Project ID associated with this workflow run"),
-    }),
-    outputSchema: z.object({
-        result: z.string().describe("The result of the Docker operation"),
-        success: z.boolean().describe("Whether the operation was successful"),
-        toolCallCount: z.number().describe("Total number of tool calls made during execution"),
-        containerId: z.string().describe("The ID of the created Docker container"),
-        contextData: z.any().optional().describe("Context data passed through"),
-        repositoryUrl: z.string().optional().describe("Repository URL passed through"),
-        projectId: z.string().describe("Project ID passed through"),
-    }),
-    execute: async ({ inputData, runId }) => {
+    inputSchema: TestDockerStepInputSchema,
+    outputSchema: TestDockerStepOutputSchema,
+    execute: async ({ inputData, runId }): Promise<TestDockerStepOutput> => {
         await notifyStepStatus({
             stepId: "test-docker-step",
             status: "starting",
@@ -37,18 +165,6 @@ export const testDockerStep = createStep({
         });
 
         const logger = ALERTS_ONLY ? null : mastra?.getLogger();
-
-        function sh(cmd: string): Promise<string> {
-            return new Promise((resolve, reject) => {
-                exec(cmd, (error, stdout, stderr) => {
-                    if (error) {
-                        reject(new Error(stderr || error.message));
-                    } else {
-                        resolve(stdout);
-                    }
-                });
-            });
-        }
 
         try {
             // Build minimal image
@@ -97,7 +213,7 @@ EOF`;
                 status: "failed",
                 runId,
                 title: "Docker setup failed",
-                subtitle: error instanceof Error ? error.message : 'Unknown error',
+                subtitle: getErrorMessage(error),
                 level: 'error',
             });
             throw error;
@@ -105,28 +221,15 @@ EOF`;
     }
 });
 
+// =============================================================================
+// STEP 2: TEST DOCKER GITHUB CLONE STEP
+// =============================================================================
+
 export const testDockerGithubCloneStep = createStep({
     id: "test-docker-github-clone-step",
-    inputSchema: z.object({
-        result: z.string().describe("The result of the Docker operation"),
-        success: z.boolean().describe("Whether the operation was successful"),
-        toolCallCount: z.number().describe("Total number of tool calls made during execution"),
-        containerId: z.string().describe("The ID of the created Docker container"),
-        contextData: z.any().optional().describe("Context data passed through"),
-        repositoryUrl: z.string().optional().describe("Repository URL passed through"),
-        projectId: z.string().describe("Project ID passed through"),
-    }),
-    outputSchema: z.object({
-        result: z.string().describe("The result of the Docker operation"),
-        success: z.boolean().describe("Whether the operation was successful"),
-        toolCallCount: z.number().describe("Total number of tool calls made during execution"),
-        containerId: z.string().describe("The ID of the created Docker container"),
-        contextData: z.any().optional().describe("Context data passed through"),
-        repositoryUrl: z.string().optional().describe("Repository URL passed through"),
-        projectId: z.string().describe("Project ID passed through"),
-        repoPath: z.string().describe("Absolute path to the cloned repository inside the container"),
-    }),
-    execute: async ({ inputData, runId }) => {
+    inputSchema: TestDockerStepOutputSchema,
+    outputSchema: TestDockerGithubCloneStepOutputSchema,
+    execute: async ({ inputData, runId }): Promise<TestDockerGithubCloneStepOutput> => {
         await notifyStepStatus({
             stepId: "test-docker-github-clone-step",
             status: "starting",
@@ -135,6 +238,7 @@ export const testDockerGithubCloneStep = createStep({
             title: "Cloning repository",
             subtitle: "Preparing to clone repo into container",
         });
+
         return await new Promise((resolve, reject) => {
             // Copy PAT into container and use it to clone the repo, then remove the file
             const cwd = process.cwd();
@@ -148,55 +252,17 @@ export const testDockerGithubCloneStep = createStep({
                 return;
             }
 
-            // Determine repository coordinates - prioritize manual input, then contextData, then default
-            let resolvedRepoPath: string;
-            let repoOwner: string | undefined;
-            let repoName: string | undefined;
-            
-            // First, check for manually provided repository URL
-            if (inputData.repositoryUrl) {
-                const repoUrl = inputData.repositoryUrl.trim();
-                
-                // Handle different formats: "owner/repo", "https://github.com/owner/repo", "https://github.com/owner/repo.git"
-                if (repoUrl.includes('github.com/')) {
-                    // Extract from full GitHub URL
-                    const match = repoUrl.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
-                    if (match) {
-                        repoOwner = match[1];
-                        repoName = match[2];
-                        resolvedRepoPath = `${repoOwner}/${repoName}`;
-                    } else {
-                        throw new Error(`Invalid GitHub URL format: ${repoUrl}`);
-                    }
-                } else if (repoUrl.includes('/') && !repoUrl.includes(' ')) {
-                    // Handle "owner/repo" format
-                    const [ownerPart, repoPart] = repoUrl.split('/');
-                    if (ownerPart && repoPart) {
-                        repoOwner = ownerPart;
-                        repoName = repoPart;
-                        resolvedRepoPath = repoUrl;
-                    } else {
-                        throw new Error(`Invalid repository format: ${repoUrl}. Expected format: "owner/repo"`);
-                    }
-                } else {
-                    throw new Error(`Invalid repository format: ${repoUrl}. Expected format: "owner/repo" or GitHub URL`);
-                }
-            } else {
-                // Fall back to contextData extraction
-                const context: any = (inputData as any)?.contextData || {};
-                repoOwner = typeof context.owner === 'string' ? context.owner : undefined;
-                repoName = typeof context.repo === 'string' ? context.repo : undefined;
-                const fullName: string | undefined = typeof context.fullName === 'string' ? context.fullName : (typeof context.full_name === 'string' ? context.full_name : undefined);
-                if ((!repoOwner || !repoName) && fullName && fullName.includes('/')) {
-                    const [ownerPart, repoPart] = fullName.split('/');
-                    repoOwner = repoOwner || ownerPart;
-                    repoName = repoName || repoPart;
-                }
-                resolvedRepoPath = (repoOwner && repoName) ? `${repoOwner}/${repoName}` : 'AntonioAEMartins/yc-24h-hackathon-agent';
-            }
+            // Extract repository coordinates
+            const { repo: repoName, resolvedRepoPath } = extractRepoCoordinates(
+                inputData.repositoryUrl,
+                inputData.contextData
+            );
+
             // Get default branch from contextData
-            const context: any = (inputData as any)?.contextData || {};
-            const defaultBranch: string | undefined = typeof context.defaultBranch === 'string' ? context.defaultBranch : (typeof context.default_branch === 'string' ? context.default_branch : undefined);
+            const context = inputData.contextData || {};
+            const defaultBranch = typeof context.defaultBranch === 'string' 
+                ? context.defaultBranch 
+                : (typeof context.default_branch === 'string' ? context.default_branch : undefined);
             const branchArg = defaultBranch ? ` --branch ${defaultBranch} ` : ' ';
 
             // Compute expected repo path in the container
@@ -208,7 +274,7 @@ export const testDockerGithubCloneStep = createStep({
             // First, copy the credentials file to the container
             const copyCmd = `docker cp "${credentialsPath}" ${inputData.containerId}:/root/.docker.credentials`;
             
-            exec(copyCmd, (copyError, copyStdout, copyStderr) => {
+            exec(copyCmd, (copyError, _copyStdout, copyStderr) => {
                 if (copyError) {
                     reject(new Error(`Failed to copy credentials file: ${copyStderr || copyError.message}`));
                     return;
@@ -217,7 +283,7 @@ export const testDockerGithubCloneStep = createStep({
                 // Verify the file was copied successfully
                 const verifyCmd = `docker exec ${inputData.containerId} test -f /root/.docker.credentials`;
                 
-                exec(verifyCmd, (verifyError, verifyStdout, verifyStderr) => {
+                exec(verifyCmd, (verifyError, _verifyStdout, verifyStderr) => {
                     if (verifyError) {
                         reject(new Error(`Credentials file not found in container after copy: ${verifyStderr || verifyError.message}`));
                         return;
@@ -257,30 +323,15 @@ export const testDockerGithubCloneStep = createStep({
     }
 });
 
-// Step: Post project description to backend
+// =============================================================================
+// STEP 3: POST PROJECT DESCRIPTION STEP
+// =============================================================================
+
 export const postProjectDescriptionStep = createStep({
     id: "post-project-description-step",
-    inputSchema: z.object({
-        result: z.string().describe("The result of the Docker operation"),
-        success: z.boolean().describe("Whether the operation was successful"),
-        toolCallCount: z.number().describe("Total number of tool calls made during execution"),
-        containerId: z.string().describe("The ID of the created Docker container"),
-        contextData: z.any().optional().describe("Context data passed through"),
-        repositoryUrl: z.string().optional().describe("Repository URL passed through"),
-        projectId: z.string().describe("Project ID passed through"),
-        repoPath: z.string().describe("Absolute path to the cloned repository inside the container"),
-    }),
-    outputSchema: z.object({
-        result: z.string().describe("The result of the Docker operation"),
-        success: z.boolean().describe("Whether the operation was successful"),
-        toolCallCount: z.number().describe("Total number of tool calls made during execution"),
-        containerId: z.string().describe("The ID of the created Docker container"),
-        contextData: z.any().optional().describe("Context data passed through"),
-        repositoryUrl: z.string().optional().describe("Repository URL passed through"),
-        projectId: z.string().describe("Project ID passed through"),
-        repoPath: z.string().describe("Absolute path to the cloned repository inside the container"),
-    }),
-    execute: async ({ inputData, mastra, runId }) => {
+    inputSchema: PostProjectStepInputSchema,
+    outputSchema: PostProjectStepOutputSchema,
+    execute: async ({ inputData, mastra, runId }): Promise<PostProjectStepOutput> => {
         const logger = ALERTS_ONLY ? null : mastra?.getLogger();
         await notifyStepStatus({
             stepId: "post-project-description-step",
@@ -291,18 +342,14 @@ export const postProjectDescriptionStep = createStep({
             subtitle: "Posting description to backend",
         });
 
-        // Extract projectId from inputData (now passed directly)
-        const context: any = inputData.contextData || {};
+        const context = inputData.contextData || {};
         const projectId = inputData.projectId;
-
         const baseUrl = process.env.BASE_URL || 'http://localhost:3000';
         const descriptionUrl = `${baseUrl}/api/projects/${projectId}/description`;
-
-        // Build project description using a dedicated agent first; fall back to static heuristics
         const containerId = inputData.containerId;
-        const repoPath = (inputData as any).repoPath || "/app";
+        const repoPath = inputData.repoPath || "/app";
 
-        const sh = (cmd: string): Promise<string> => {
+        const dockerSh = (cmd: string): Promise<string> => {
             return new Promise((resolve, reject) => {
                 exec(`docker exec ${containerId} bash -lc ${JSON.stringify(cmd)}`, (error, stdout, stderr) => {
                     if (error) reject(new Error(stderr || error.message));
@@ -311,41 +358,8 @@ export const postProjectDescriptionStep = createStep({
             });
         };
 
-        const getCredToken = (): string | undefined => {
-            try {
-                const cwd = process.cwd();
-                const primaryPath = path.resolve(cwd, '.docker.credentials');
-                const fallbackPath = path.resolve(cwd, '..', '..', '.docker.credentials');
-                const credPath = existsSync(primaryPath) ? primaryPath : (existsSync(fallbackPath) ? fallbackPath : undefined);
-                if (!credPath) return undefined;
-                const raw = readFileSync(credPath, 'utf8');
-                const m = raw.match(/GITHUB_PAT\s*=\s*(.+)/);
-                return m ? m[1].trim() : undefined;
-            } catch {
-                return undefined;
-            }
-        };
-
         const parseOwnerRepo = (): { owner?: string; repo?: string } => {
-            let owner: string | undefined;
-            let repo: string | undefined;
-            const url = (inputData as any).repositoryUrl as string | undefined;
-            if (url) {
-                if (url.includes('github.com/')) {
-                    const match = url.match(/github\.com\/([^\/]+)\/([^\/.]+)/);
-                    if (match) { owner = match[1]; repo = match[2]; }
-                } else if (url.includes('/') && !url.includes(' ')) {
-                    const parts = url.split('/');
-                    if (parts.length >= 2) { owner = parts[0]; repo = parts[1]; }
-                }
-            }
-            if (!owner || !repo) {
-                const ctxOwner = typeof context.owner === 'string' ? context.owner : undefined;
-                const ctxRepo = typeof context.repo === 'string' ? context.repo : undefined;
-                const fullName: string | undefined = typeof context.fullName === 'string' ? context.fullName : (typeof context.full_name === 'string' ? context.full_name : undefined);
-                if (ctxOwner && ctxRepo) { owner = ctxOwner; repo = ctxRepo; }
-                else if (fullName && fullName.includes('/')) { const [o, r] = fullName.split('/'); owner = o; repo = r; }
-            }
+            const { owner, repo } = extractRepoCoordinates(inputData.repositoryUrl, inputData.contextData);
             return { owner, repo };
         };
 
@@ -354,11 +368,11 @@ export const postProjectDescriptionStep = createStep({
                 const { owner, repo } = parseOwnerRepo();
                 if (!owner || !repo) return {};
                 const token = getCredToken();
-                const headers: any = { 'Accept': 'application/vnd.github+json' };
+                const headers: Record<string, string> = { 'Accept': 'application/vnd.github+json' };
                 if (token) headers['Authorization'] = `Bearer ${token}`;
                 const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
                 if (!res.ok) return {};
-                const json: any = await res.json();
+                const json = await res.json() as { description?: string; topics?: string[] };
                 const topics = Array.isArray(json?.topics) ? json.topics : undefined;
                 return { about: typeof json?.description === 'string' ? json.description : undefined, topics };
             } catch { return {}; }
@@ -366,11 +380,11 @@ export const postProjectDescriptionStep = createStep({
 
         const tryReadme = async (): Promise<string | undefined> => {
             try {
-                const findCmd = `cd ${JSON.stringify(repoPath)} && for f in README README.md README.rst README.txt readme.md Readme.md; do if [ -f \"$f\" ]; then echo \"$f\"; break; fi; done`;
-                const p = (await sh(findCmd)).trim();
+                const findCmd = `cd ${JSON.stringify(repoPath)} && for f in README README.md README.rst README.txt readme.md Readme.md; do if [ -f "$f" ]; then echo "$f"; break; fi; done`;
+                const p = (await dockerSh(findCmd)).trim();
                 if (!p) return undefined;
                 const filePath = `${repoPath}/${p}`;
-                const content = await sh(`sed -n '1,200p' ${JSON.stringify(filePath)}`);
+                const content = await dockerSh(`sed -n '1,200p' ${JSON.stringify(filePath)}`);
                 return content.trim();
             } catch { return undefined; }
         };
@@ -378,10 +392,10 @@ export const postProjectDescriptionStep = createStep({
         const tryPackageJson = async (): Promise<{ name?: string; description?: string; keywords?: string[] } | undefined> => {
             try {
                 const pjPath = `${repoPath}/package.json`;
-                const exists = (await sh(`test -f ${JSON.stringify(pjPath)} && echo EXISTS || echo MISSING`)).trim();
+                const exists = (await dockerSh(`test -f ${JSON.stringify(pjPath)} && echo EXISTS || echo MISSING`)).trim();
                 if (exists !== 'EXISTS') return undefined;
-                const raw = await sh(`cat ${JSON.stringify(pjPath)}`);
-                const json = JSON.parse(raw);
+                const raw = await dockerSh(`cat ${JSON.stringify(pjPath)}`);
+                const json = JSON.parse(raw) as { name?: string; description?: string; keywords?: string[] };
                 return { name: json?.name, description: json?.description, keywords: Array.isArray(json?.keywords) ? json.keywords : undefined };
             } catch { return undefined; }
         };
@@ -390,7 +404,7 @@ export const postProjectDescriptionStep = createStep({
             const features: string[] = [];
             const languages: string[] = [];
             try {
-                const filesOut = await sh(`cd ${JSON.stringify(repoPath)} && (git ls-files || find . -type f)`);
+                const filesOut = await dockerSh(`cd ${JSON.stringify(repoPath)} && (git ls-files || find . -type f)`);
                 const lines = filesOut.split('\n').map(l => l.trim()).filter(Boolean);
                 const counts: Record<string, number> = {};
                 for (const lf of lines) {
@@ -398,14 +412,14 @@ export const postProjectDescriptionStep = createStep({
                     if (name.includes('node_modules')) continue;
                     const m = name.match(/\.([a-z0-9]+)$/);
                     const ext = m ? m[1] : '';
-                    const map: Record<string, string> = {
+                    const langMap: Record<string, string> = {
                         'ts': 'TypeScript', 'tsx': 'TypeScript', 'js': 'JavaScript', 'jsx': 'JavaScript',
                         'py': 'Python', 'rb': 'Ruby', 'go': 'Go', 'rs': 'Rust', 'java': 'Java', 'kt': 'Kotlin',
                         'c': 'C', 'cpp': 'C++', 'cc': 'C++', 'cxx': 'C++', 'hpp': 'C++', 'mm': 'Objective-C',
                         'php': 'PHP', 'swift': 'Swift', 'm': 'Objective-C', 'scala': 'Scala',
                         'html': 'HTML', 'css': 'CSS', 'scss': 'SCSS', 'sass': 'Sass', 'md': 'Markdown', 'sh': 'Shell'
                     };
-                    const lang = map[ext];
+                    const lang = langMap[ext];
                     if (lang) counts[lang] = (counts[lang] || 0) + 1;
                 }
                 const sorted = Object.entries(counts).sort((a,b) => b[1]-a[1]).map(([k]) => k);
@@ -422,10 +436,10 @@ export const postProjectDescriptionStep = createStep({
                     { path: `${repoPath}/prisma/schema.prisma`, feat: 'Prisma' },
                 ];
                 for (const c of configs) {
-                    const ex = (await sh(`test -e ${JSON.stringify(c.path)} && echo EXISTS || echo MISSING`)).trim();
+                    const ex = (await dockerSh(`test -e ${JSON.stringify(c.path)} && echo EXISTS || echo MISSING`)).trim();
                     if (ex === 'EXISTS') features.push(c.feat);
                 }
-            } catch {}
+            } catch { /* ignore */ }
             return { languages, features };
         };
 
@@ -449,7 +463,7 @@ Do not read more than 8 content files total. Keep outputs small using head and g
 Hints: ${JSON.stringify(hints)}.
 
 When done, return STRICT JSON only: {"description": string, "sources": string[], "confidence": number, "notes": string}.`;
-                const res: any = await agent.generate(prompt, { maxSteps: 12, maxRetries: 2 });
+                const res = await agent.generate(prompt, { maxSteps: 12, maxRetries: 2 });
                 const text: string = (res?.text || "").toString();
                 let jsonText = text;
                 const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/```\s*([\s\S]*?)\s*```/);
@@ -461,7 +475,7 @@ When done, return STRICT JSON only: {"description": string, "sources": string[],
                     if (s !== -1 && e !== -1 && e > s) jsonText = text.substring(s, e + 1);
                 }
                 try {
-                    const parsed = JSON.parse(jsonText);
+                    const parsed = JSON.parse(jsonText) as { description?: string; confidence?: number; sources?: unknown[] };
                     if (parsed && typeof parsed.description === 'string' && parsed.description.trim().length > 0) {
                         finalDescription = String(parsed.description).replace(/\s+/g, ' ').trim();
                         logger?.info("🧠 Description agent success", {
@@ -473,11 +487,11 @@ When done, return STRICT JSON only: {"description": string, "sources": string[],
                         });
                     }
                 } catch (e) {
-                    logger?.warn("⚠️ Agent JSON parse failed; will use fallback", { error: e instanceof Error ? e.message : String(e), type: "AGENT_DESCRIPTION", runId });
+                    logger?.warn("⚠️ Agent JSON parse failed; will use fallback", { error: getErrorMessage(e), type: "AGENT_DESCRIPTION", runId });
                 }
             }
         } catch (e) {
-            logger?.warn("⚠️ Agent invocation failed; will use fallback", { error: e instanceof Error ? e.message : String(e), type: "AGENT_DESCRIPTION", runId });
+            logger?.warn("⚠️ Agent invocation failed; will use fallback", { error: getErrorMessage(e), type: "AGENT_DESCRIPTION", runId });
         }
 
         // 2) Fallback to static heuristics if needed
@@ -527,14 +541,6 @@ When done, return STRICT JSON only: {"description": string, "sources": string[],
         });
 
         try {
-            logger?.debug("🔗 HTTP request details", {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                url: descriptionUrl,
-                payload,
-                type: "HTTP_REQUEST",
-                runId,
-            });
             const res = await fetch(descriptionUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -574,7 +580,7 @@ When done, return STRICT JSON only: {"description": string, "sources": string[],
         } catch (err) {
             logger?.warn("⚠️  Failed to POST description", { 
                 url: descriptionUrl,
-                error: err instanceof Error ? err.message : String(err),
+                error: getErrorMessage(err),
                 stack: err instanceof Error ? err.stack : undefined,
                 type: "BACKEND_POST",
                 runId 
@@ -598,30 +604,15 @@ When done, return STRICT JSON only: {"description": string, "sources": string[],
     },
 });
 
-// Step: Post project tech stack to backend
+// =============================================================================
+// STEP 4: POST PROJECT STACK STEP
+// =============================================================================
+
 export const postProjectStackStep = createStep({
     id: "post-project-stack-step",
-    inputSchema: z.object({
-        result: z.string().describe("The result of the Docker operation"),
-        success: z.boolean().describe("Whether the operation was successful"),
-        toolCallCount: z.number().describe("Total number of tool calls made during execution"),
-        containerId: z.string().describe("The ID of the created Docker container"),
-        contextData: z.any().optional().describe("Context data passed through"),
-        repositoryUrl: z.string().optional().describe("Repository URL passed through"),
-        projectId: z.string().describe("Project ID passed through"),
-        repoPath: z.string().describe("Absolute path to the cloned repository inside the container"),
-    }),
-    outputSchema: z.object({
-        result: z.string().describe("The result of the Docker operation"),
-        success: z.boolean().describe("Whether the operation was successful"),
-        toolCallCount: z.number().describe("Total number of tool calls made during execution"),
-        containerId: z.string().describe("The ID of the created Docker container"),
-        contextData: z.any().optional().describe("Context data passed through"),
-        repositoryUrl: z.string().optional().describe("Repository URL passed through"),
-        projectId: z.string().describe("Project ID passed through"),
-        repoPath: z.string().describe("Absolute path to the cloned repository inside the container"),
-    }),
-    execute: async ({ inputData, mastra, runId }) => {
+    inputSchema: PostProjectStepInputSchema,
+    outputSchema: PostProjectStepOutputSchema,
+    execute: async ({ inputData, mastra, runId }): Promise<PostProjectStepOutput> => {
         const logger = ALERTS_ONLY ? null : mastra?.getLogger();
         await notifyStepStatus({
             stepId: "post-project-stack-step",
@@ -632,14 +623,14 @@ export const postProjectStackStep = createStep({
             subtitle: "Posting tech stack to backend",
         });
 
-        // Extract projectId from inputData (now passed directly)
-        const context: any = inputData.contextData || {};
+        const context = inputData.contextData || {};
         const projectId = inputData.projectId;
-
         const baseUrl = process.env.BASE_URL || 'http://localhost:3000';
         const stackUrl = `${baseUrl}/api/projects/${projectId}/stack`;
+        const containerId = inputData.containerId;
+        const repoPath = inputData.repoPath;
 
-        // Enhanced detection using GitHub API + local file analysis and expanded icon mapping
+        // Normalize name helper
         const normalizeName = (name: string): string => name.toLowerCase().replace(/@/g, '').replace(/[^a-z0-9+\-.]/g, '');
 
         const stackMap: Record<string, { icon: string; title: string; description: string }> = {
@@ -650,59 +641,18 @@ export const postProjectStackStep = createStep({
             'go': { icon: 'go', title: 'Go', description: 'Compiled language for fast, concurrent services by Google.' },
             'rust': { icon: 'rust', title: 'Rust', description: 'Memory-safe systems programming language.' },
             'java': { icon: 'java', title: 'Java', description: 'General-purpose language for enterprise applications.' },
-            'c++': { icon: 'cpp', title: 'C++', description: 'High-performance systems and application language.' },
-            'c': { icon: 'c', title: 'C', description: 'Low-level systems programming language.' },
-            'c#': { icon: 'cs', title: 'C#', description: 'Modern language for .NET platforms.' },
-            'php': { icon: 'php', title: 'PHP', description: 'Scripting language for server-side web development.' },
-            'ruby': { icon: 'ruby', title: 'Ruby', description: 'Dynamic language focused on simplicity and productivity.' },
-            'kotlin': { icon: 'kotlin', title: 'Kotlin', description: 'Modern JVM language by JetBrains.' },
-            'swift': { icon: 'swift', title: 'Swift', description: 'Apple’s language for iOS and macOS development.' },
-            'scala': { icon: 'scala', title: 'Scala', description: 'JVM language blending OOP and functional programming.' },
-            'shell': { icon: 'bash', title: 'Shell', description: 'Shell scripting for automation.' },
-            'html': { icon: 'html', title: 'HTML', description: 'Markup language for web pages.' },
-            'css': { icon: 'css', title: 'CSS', description: 'Stylesheet language for web pages.' },
-            'scss': { icon: 'sass', title: 'SCSS', description: 'Sass syntax for CSS with variables and nesting.' },
-            'sass': { icon: 'sass', title: 'Sass', description: 'CSS preprocessor with powerful features.' },
-
-            // JS frameworks/tools
+            // Frameworks
             'next': { icon: 'nextjs', title: 'Next.js', description: 'React framework for hybrid rendering (SSR/SSG) and routing by Vercel.' },
             'nextjs': { icon: 'nextjs', title: 'Next.js', description: 'React framework for hybrid rendering (SSR/SSG) and routing by Vercel.' },
             'react': { icon: 'react', title: 'React', description: 'Component-based UI library for building interactive interfaces.' },
             'vue': { icon: 'vue', title: 'Vue.js', description: 'Progressive framework for building user interfaces.' },
-            'svelte': { icon: 'svelte', title: 'Svelte', description: 'Compiler-based UI framework for minimal runtime.' },
             'vite': { icon: 'vite', title: 'Vite', description: 'Next-gen frontend tooling with fast dev server and build.' },
             'vitest': { icon: 'vitest', title: 'Vitest', description: 'Vite-native unit test framework with Jest-compatible API.' },
             'jest': { icon: 'jest', title: 'Jest', description: 'Delightful JavaScript testing framework.' },
             'tailwind': { icon: 'tailwind', title: 'Tailwind CSS', description: 'Utility-first CSS framework for rapid UI development.' },
-            'express': { icon: 'express', title: 'Express', description: 'Minimal and flexible Node.js web application framework.' },
-            'nestjs': { icon: 'nestjs', title: 'NestJS', description: 'Progressive Node.js framework for scalable server-side apps.' },
-            'graphql': { icon: 'graphql', title: 'GraphQL', description: 'Query language for APIs and runtime for fulfilling queries.' },
             'prisma': { icon: 'prisma', title: 'Prisma', description: 'Type-safe ORM for Node.js and TypeScript.' },
-            'sequelize': { icon: 'sequelize', title: 'Sequelize', description: 'Promise-based Node.js ORM for Postgres, MySQL, etc.' },
-            'redux': { icon: 'redux', title: 'Redux', description: 'Predictable state container for JavaScript apps.' },
-            'webpack': { icon: 'webpack', title: 'Webpack', description: 'Module bundler for JavaScript applications.' },
-            'rollup': { icon: 'rollupjs', title: 'Rollup', description: 'Module bundler for JavaScript libraries.' },
-            'eslint': { icon: 'js', title: 'ESLint', description: 'Pluggable linting utility for JavaScript and TypeScript.' },
-
-            // Python
-            'fastapi': { icon: 'fastapi', title: 'FastAPI', description: 'High performance Python web framework for APIs.' },
-            'flask': { icon: 'flask', title: 'Flask', description: 'Lightweight WSGI web application framework.' },
-            'django': { icon: 'django', title: 'Django', description: 'High-level Python web framework.' },
-            'pytorch': { icon: 'pytorch', title: 'PyTorch', description: 'Deep learning framework.' },
-            'tensorflow': { icon: 'tensorflow', title: 'TensorFlow', description: 'End-to-end open source platform for machine learning.' },
-            'sklearn': { icon: 'sklearn', title: 'Scikit-learn', description: 'Machine learning in Python.' },
-
-            // Infra / DB / Messaging
             'docker': { icon: 'docker', title: 'Docker', description: 'Containerization platform.' },
-            'kubernetes': { icon: 'kubernetes', title: 'Kubernetes', description: 'Container orchestration system.' },
-            'terraform': { icon: 'terraform', title: 'Terraform', description: 'Infrastructure as code tool.' },
             'postgres': { icon: 'postgres', title: 'PostgreSQL', description: 'Advanced open source relational database.' },
-            'sqlite': { icon: 'sqlite', title: 'SQLite', description: 'Serverless SQL database engine.' },
-            'mongodb': { icon: 'mongodb', title: 'MongoDB', description: 'NoSQL document database.' },
-            'redis': { icon: 'redis', title: 'Redis', description: 'In-memory data store for caching and messaging.' },
-            'rabbitmq': { icon: 'rabbitmq', title: 'RabbitMQ', description: 'Message broker for distributed systems.' },
-            'elasticsearch': { icon: 'elasticsearch', title: 'Elasticsearch', description: 'Search and analytics engine.' },
-            'nginx': { icon: 'nginx', title: 'Nginx', description: 'High performance HTTP and reverse proxy server.' },
         };
 
         const mapToStackItem = (name: string): { title: string; description: string; icon: string } | null => {
@@ -717,43 +667,8 @@ export const postProjectStackStep = createStep({
             return null;
         };
 
-        const { containerId, repoPath } = (inputData as any);
-
-        const getCredToken = (): string | undefined => {
-            try {
-                const cwd = process.cwd();
-                const primaryPath = path.resolve(cwd, '.docker.credentials');
-                const fallbackPath = path.resolve(cwd, '..', '..', '.docker.credentials');
-                const credPath = existsSync(primaryPath) ? primaryPath : (existsSync(fallbackPath) ? fallbackPath : undefined);
-                if (!credPath) return undefined;
-                const raw = readFileSync(credPath, 'utf8');
-                const m = raw.match(/GITHUB_PAT\s*=\s*(.+)/);
-                return m ? m[1].trim() : undefined;
-            } catch { return undefined; }
-        };
-
         const parseOwnerRepo = (): { owner?: string; repo?: string } => {
-            let owner: string | undefined;
-            let repo: string | undefined;
-            const url = (inputData as any).repositoryUrl as string | undefined;
-            if (url) {
-                if (url.includes('github.com/')) {
-                    const match = url.match(/github\.com\/([^\/]+)\/([^\/.]+)/);
-                    if (match) { owner = match[1]; repo = match[2]; }
-                } else if (url.includes('/') && !url.includes(' ')) {
-                    const parts = url.split('/');
-                    if (parts.length >= 2) { owner = parts[0]; repo = parts[1]; }
-                }
-            }
-            if (!owner || !repo) {
-                const ctxOwner = typeof context.owner === 'string' ? context.owner : undefined;
-                const ctxRepo = typeof context.repo === 'string' ? context.repo : undefined;
-                const fullName: string | undefined = typeof context.fullName === 'string' ? context.fullName : (typeof context.full_name === 'string' ? context.full_name : undefined);
-                if (ctxOwner && ctxRepo) { owner = ctxOwner; repo = ctxRepo; }
-                else if (fullName && fullName.includes('/')) {
-                    const [o, r] = fullName.split('/'); owner = o; repo = r;
-                }
-            }
+            const { owner, repo } = extractRepoCoordinates(inputData.repositoryUrl, inputData.contextData);
             return { owner, repo };
         };
 
@@ -762,7 +677,7 @@ export const postProjectStackStep = createStep({
                 const { owner, repo } = parseOwnerRepo();
                 if (!owner || !repo) return [];
                 const token = getCredToken();
-                const headers: any = { 'Accept': 'application/vnd.github+json' };
+                const headers: Record<string, string> = { 'Accept': 'application/vnd.github+json' };
                 if (token) headers['Authorization'] = `Bearer ${token}`;
                 const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/languages`, { headers });
                 if (!res.ok) return [];
@@ -782,7 +697,7 @@ export const postProjectStackStep = createStep({
             } catch { return []; }
         };
 
-        const sh = (cmd: string): Promise<string> => new Promise((resolve, reject) => {
+        const dockerSh = (cmd: string): Promise<string> => new Promise((resolve, reject) => {
             exec(`docker exec ${containerId} bash -lc ${JSON.stringify(cmd)}`, (error, stdout, stderr) => {
                 if (error) reject(new Error(stderr || error.message)); else resolve(stdout);
             });
@@ -792,7 +707,7 @@ export const postProjectStackStep = createStep({
             const items: Array<{ title: string; icon: string; description: string }> = [];
             // Languages via extensions
             try {
-                const filesOut = await sh(`cd ${JSON.stringify(repoPath)} && (git ls-files || find . -type f)`);
+                const filesOut = await dockerSh(`cd ${JSON.stringify(repoPath)} && (git ls-files || find . -type f)`);
                 const lines = filesOut.split('\n').map(l => l.trim()).filter(Boolean);
                 const counts: Record<string, number> = {};
                 for (const lf of lines) {
@@ -800,44 +715,34 @@ export const postProjectStackStep = createStep({
                     if (name.includes('node_modules')) continue;
                     const m = name.match(/\.([a-z0-9]+)$/);
                     const ext = m ? m[1] : '';
-                    const map: Record<string, string> = {
+                    const langMap: Record<string, string> = {
                         'ts': 'typescript', 'tsx': 'typescript', 'js': 'javascript', 'jsx': 'javascript',
                         'py': 'python', 'rb': 'ruby', 'go': 'go', 'rs': 'rust', 'java': 'java', 'kt': 'kotlin',
                         'c': 'c', 'cpp': 'c++', 'cc': 'c++', 'cxx': 'c++', 'hpp': 'c++',
                         'php': 'php', 'swift': 'swift', 'scala': 'scala', 'sh': 'shell', 'css': 'css', 'scss': 'scss', 'html': 'html'
                     };
-                    const lang = map[ext]; if (lang) counts[lang] = (counts[lang] || 0) + 1;
+                    const lang = langMap[ext]; if (lang) counts[lang] = (counts[lang] || 0) + 1;
                 }
                 const langs = Object.entries(counts).sort((a,b) => b[1]-a[1]).map(([k]) => k).slice(0, 5);
                 for (const l of langs) { const it = mapToStackItem(l); if (it) items.push(it); }
-            } catch {}
+            } catch { /* ignore */ }
             // JS libraries via package.json
             try {
                 const pjPath = `${repoPath}/package.json`;
-                const exists = (await sh(`test -f ${JSON.stringify(pjPath)} && echo EXISTS || echo MISSING`)).trim();
+                const exists = (await dockerSh(`test -f ${JSON.stringify(pjPath)} && echo EXISTS || echo MISSING`)).trim();
                 if (exists === 'EXISTS') {
-                    const raw = await sh(`cat ${JSON.stringify(pjPath)}`);
-                    const pkg = JSON.parse(raw);
+                    const raw = await dockerSh(`cat ${JSON.stringify(pjPath)}`);
+                    const pkg = JSON.parse(raw) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
                     const deps = Object.keys({ ...(pkg.dependencies||{}), ...(pkg.devDependencies||{}) });
                     const candidates = deps.map((d: string) => normalizeName(d));
                     for (const c of candidates) { const it = mapToStackItem(c); if (it) items.push(it); }
                 }
-            } catch {}
-            // Python via requirements.txt
-            try {
-                const reqPath = `${repoPath}/requirements.txt`;
-                const exists = (await sh(`test -f ${JSON.stringify(reqPath)} && echo EXISTS || echo MISSING`)).trim();
-                if (exists === 'EXISTS') {
-                    const raw = await sh(`cat ${JSON.stringify(reqPath)}`);
-                    const pkgs = raw.split(/\r?\n/).map(l => l.trim().split('==')[0]).filter(Boolean);
-                    for (const p of pkgs) { const it = mapToStackItem(p); if (it) items.push(it); }
-                }
-            } catch {}
+            } catch { /* ignore */ }
             // Docker presence
             try {
-                const dockerfile = (await sh(`test -f ${JSON.stringify(repoPath + '/Dockerfile')} && echo EXISTS || echo MISSING`)).trim();
+                const dockerfile = (await dockerSh(`test -f ${JSON.stringify(repoPath + '/Dockerfile')} && echo EXISTS || echo MISSING`)).trim();
                 if (dockerfile === 'EXISTS') items.push(stackMap['docker']);
-            } catch {}
+            } catch { /* ignore */ }
             return items;
         };
 
@@ -865,38 +770,22 @@ export const postProjectStackStep = createStep({
             let successCount = 0;
             let lastError: string | undefined;
 
-            // Send each tech stack item individually as the backend expects single items
+            // Send each tech stack item individually
             for (const item of techStack) {
-                const payload = {
+                const stackPayload = {
                     title: item.title,
                     description: item.description,
-                    icon: item.icon || null, // Backend expects string | null
+                    icon: item.icon || null,
                 };
-
-                logger?.debug("🔗 HTTP request details", {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    url: stackUrl,
-                    payload,
-                    type: "HTTP_REQUEST",
-                    runId,
-                });
 
                 const res = await fetch(stackUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
+                    body: JSON.stringify(stackPayload),
                 });
 
                 if (res.ok) {
                     successCount++;
-                    logger?.debug("✅ Stack item posted successfully", {
-                        item: item.title,
-                        status: res.status,
-                        projectId,
-                        type: "BACKEND_RESPONSE",
-                        runId,
-                    });
                 } else {
                     const text = await res.text().catch(() => '');
                     lastError = `${item.title}: ${res.status} ${text}`;
@@ -912,17 +801,6 @@ export const postProjectStackStep = createStep({
             }
 
             const success = successCount > 0;
-            logger?.info("📥 Backend stack posting completed", {
-                successCount,
-                totalItems: techStack.length,
-                success,
-                lastError,
-                url: stackUrl,
-                projectId,
-                type: "BACKEND_RESPONSE",
-                runId,
-            });
-
             await notifyStepStatus({
                 stepId: "post-project-stack-step",
                 status: success ? "completed" : "failed",
@@ -935,7 +813,7 @@ export const postProjectStackStep = createStep({
         } catch (err) {
             logger?.warn("⚠️  Failed to POST stack items", { 
                 url: stackUrl,
-                error: err instanceof Error ? err.message : String(err),
+                error: getErrorMessage(err),
                 stack: err instanceof Error ? err.stack : undefined,
                 type: "BACKEND_POST",
                 runId 
@@ -959,45 +837,23 @@ export const postProjectStackStep = createStep({
     },
 });
 
+// =============================================================================
+// STEP 5: DOCKER SAVE CONTEXT STEP
+// =============================================================================
+
 export const dockerSaveContextStep = createStep({
     id: "docker-save-context-step",
-    inputSchema: z.object({
-        "post-project-description-step": z.object({
-            result: z.string(),
-            success: z.boolean(),
-            toolCallCount: z.number(),
-            containerId: z.string(),
-            contextData: z.any().optional(),
-            repositoryUrl: z.string().optional(),
-            projectId: z.string(),
-            repoPath: z.string(),
-        }),
-        "post-project-stack-step": z.object({
-            result: z.string(),
-            success: z.boolean(),
-            toolCallCount: z.number(),
-            containerId: z.string(),
-            contextData: z.any().optional(),
-            repositoryUrl: z.string().optional(),
-            projectId: z.string(),
-            repoPath: z.string(),
-        }),
-    }),
-    outputSchema: z.object({
-        result: z.string().describe("The result of the Docker operation"),
-        success: z.boolean().describe("Whether the operation was successful"),
-        toolCallCount: z.number().describe("Total number of tool calls made during execution"),
-        containerId: z.string().describe("The ID of the created Docker container"),
-        contextPath: z.string().describe("Path where context was saved in the container"),
-        repoPath: z.string().describe("Absolute path to the cloned repository inside the container"),
-    }),
-    execute: async ({ inputData, mastra, runId }) => {
-        const desc = (inputData as any)["post-project-description-step"];
+    inputSchema: ParallelPostProjectOutputSchema,
+    outputSchema: DockerSaveContextStepOutputSchema,
+    execute: async ({ inputData, mastra, runId }): Promise<DockerSaveContextStepOutput> => {
+        const desc = inputData["post-project-description-step"];
         const containerId = desc.containerId;
         const contextData = desc.contextData;
         const repoPath = desc.repoPath || '';
+        const projectId = desc.projectId;
         const logger = ALERTS_ONLY ? null : mastra?.getLogger();
         const contextPath = "/app/agent.context.json";
+
         await notifyStepStatus({
             stepId: "save-context-step",
             status: "starting",
@@ -1028,50 +884,23 @@ export const dockerSaveContextStep = createStep({
             }
 
             const contextToSave = contextData;
-
-            // Convert context to JSON string
             const contextJson = JSON.stringify(contextToSave, null, 2);
             
-            logger?.debug("📝 Preparing to write context directly to container", {
-                contextSize: `${Math.round(contextJson.length / 1024)}KB`,
-                contextPath,
-                type: "DOCKER_CONTEXT_SAVE",
-                runId: runId,
-            });
-
-            // Write context file to temp location then copy to Docker container (fast and reliable)
+            // Write context file to temp location then copy to Docker container
             return await new Promise((resolve, reject) => {
                 let tempFilePath: string | null = null;
                 
                 try {
-                    // Create temp file with JSON content
                     const tempDir = mkdtempSync(path.join(os.tmpdir(), 'docker-context-'));
                     tempFilePath = path.join(tempDir, 'context.json');
                     writeFileSync(tempFilePath, contextJson, 'utf8');
-                    
-                    logger?.debug("🐳 Copying context file to Docker container", {
-                        tempFilePath,
-                        contextPath,
-                        type: "DOCKER_CONTEXT_SAVE",
-                        runId: runId,
-                    });
 
-                    // Copy file to container
                     const copyCmd = `docker cp "${tempFilePath}" ${containerId}:${contextPath}`;
                     
-                    exec(copyCmd, (copyError, copyStdout, copyStderr) => {
+                    exec(copyCmd, (copyError, _copyStdout, copyStderr) => {
                         // Clean up temp file
                         if (tempFilePath) {
-                            try {
-                                unlinkSync(tempFilePath);
-                            } catch (cleanupError) {
-                                logger?.warn("⚠️  Failed to cleanup temp file", {
-                                    tempFilePath,
-                                    error: cleanupError instanceof Error ? cleanupError.message : 'Unknown error',
-                                    type: "DOCKER_CONTEXT_SAVE",
-                                    runId: runId,
-                                });
-                            }
+                            try { unlinkSync(tempFilePath); } catch { /* ignore */ }
                         }
 
                         if (copyError) {
@@ -1084,7 +913,7 @@ export const dockerSaveContextStep = createStep({
                             return;
                         }
 
-                        // Verify file exists and has content
+                        // Verify file exists
                         const verifyCmd = `docker exec ${containerId} bash -c "test -f ${contextPath} && wc -c ${contextPath}"`;
                         
                         exec(verifyCmd, (verifyError, verifyStdout, verifyStderr) => {
@@ -1103,7 +932,6 @@ export const dockerSaveContextStep = createStep({
                                 containerId: containerId.substring(0, 12),
                                 contextPath,
                                 fileSize: `${parseInt(fileSize)} bytes`,
-                                contextSize: `${Math.round(contextJson.length / 1024)}KB`,
                                 type: "DOCKER_CONTEXT_SAVE",
                                 runId: runId,
                             });
@@ -1120,37 +948,27 @@ export const dockerSaveContextStep = createStep({
                             });
 
                             resolve({
-                                result: `Context successfully saved to ${contextPath} (${fileSize} bytes, ${Math.round(contextJson.length / 1024)}KB)`,
+                                result: `Context successfully saved to ${contextPath} (${fileSize} bytes)`,
                                 success: true,
                                 toolCallCount: cliToolMetrics.callCount,
                                 containerId,
                                 contextPath,
                                 repoPath: repoPath || "/app",
+                                projectId,
                             });
                         });
                     });
                 } catch (tempError) {
-                    // Clean up temp file on error
                     if (tempFilePath) {
-                        try {
-                            unlinkSync(tempFilePath);
-                        } catch (cleanupError) {
-                            // Ignore cleanup errors
-                        }
+                        try { unlinkSync(tempFilePath); } catch { /* ignore */ }
                     }
-                    
-                    logger?.error("❌ Failed to create temp file for context", {
-                        error: tempError instanceof Error ? tempError.message : 'Unknown error',
-                        type: "DOCKER_CONTEXT_SAVE",
-                        runId: runId,
-                    });
-                    reject(new Error(`Failed to create temp file: ${tempError instanceof Error ? tempError.message : 'Unknown error'}`));
+                    reject(tempError instanceof Error ? tempError : new Error('Unknown temp file error'));
                 }
             });
 
         } catch (error) {
             logger?.error("❌ Context save operation failed", {
-                error: error instanceof Error ? error.message : 'Unknown error',
+                error: getErrorMessage(error),
                 type: "DOCKER_CONTEXT_SAVE",
                 runId: runId,
             });
@@ -1162,37 +980,35 @@ export const dockerSaveContextStep = createStep({
                 containerId,
                 contextPath,
                 title: "Context save failed",
-                subtitle: error instanceof Error ? error.message : 'Unknown error',
+                subtitle: getErrorMessage(error),
                 level: 'error',
                 toolCallCount: cliToolMetrics.callCount,
             });
 
             return {
-                result: `Context save failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                result: `Context save failed: ${getErrorMessage(error)}`,
                 success: false,
                 toolCallCount: cliToolMetrics.callCount,
                 containerId,
                 contextPath,
                 repoPath: repoPath || "/app",
+                projectId,
             };
         }
     }
 });
 
+// =============================================================================
+// WORKFLOW DEFINITION
+// =============================================================================
+
 export const testDockerWorkflow = createWorkflow({
     id: "test-docker-workflow",
     description: "Build Docker container, clone repository, post project info in parallel, and save context data efficiently using code-based operations",
-    inputSchema: z.object({
-        contextData: z.any().optional().describe("Optional context data to save to the container"),
-        repositoryUrl: z.string().optional().describe("Optional repository URL or owner/repo format (e.g., 'owner/repo' or 'https://github.com/owner/repo')"),
-        projectId: z.string().describe("Project ID associated with this workflow run"),
-    }),
-    outputSchema: z.object({
-        result: z.string().describe("The result of the Docker operation"),
-        success: z.boolean().describe("Whether the operation was successful"),
-        toolCallCount: z.number().describe("Total number of tool calls made during execution"),
-        containerId: z.string().describe("The ID of the created Docker container"),
-        contextPath: z.string().describe("Path where context was saved in the container"),
-        repoPath: z.string().describe("Absolute path to the cloned repository inside the container"),
-    }),
-}).then(testDockerStep).then(testDockerGithubCloneStep).parallel([postProjectDescriptionStep, postProjectStackStep]).then(dockerSaveContextStep).commit();
+    inputSchema: TestDockerStepInputSchema,
+    outputSchema: DockerSaveContextStepOutputSchema,
+}).then(testDockerStep)
+  .then(testDockerGithubCloneStep)
+  .parallel([postProjectDescriptionStep, postProjectStackStep])
+  .then(dockerSaveContextStep)
+  .commit();

@@ -5,7 +5,7 @@ import { cliToolMetrics } from "./cli-tool";
 function sh(cmd: string): Promise<{ stdout: string; stderr: string }>{
     return new Promise((resolve, reject) => {
         const { exec } = require("child_process");
-        exec(cmd, { maxBuffer: 1024 * 1024 * 20 }, (error: any, stdout: string, stderr: string) => {
+        exec(cmd, { maxBuffer: 1024 * 1024 * 20 }, (error: Error | null, stdout: string, stderr: string) => {
             if (error) {
                 reject(new Error(stderr || error.message));
             } else {
@@ -27,8 +27,8 @@ export const coverageDetectionTool = createTool({
         repoPath: z.string().optional().describe("Optional absolute repo path inside the container"),
     }),
     execute: async ({ context }) => {
-        const containerId = context?.containerId as string;
-        let repoPath = (context?.repoPath as string) || "";
+        const { containerId, repoPath: inputRepoPath } = context as { containerId: string; repoPath?: string };
+        let repoPath = inputRepoPath || "";
         if (!containerId) throw new Error("containerId is required");
 
         cliToolMetrics.callCount += 1;

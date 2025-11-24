@@ -5,8 +5,28 @@ import { cliToolMetrics } from "../../tools/cli-tool";
 import { exec } from "child_process";
 import { existsSync, readFileSync } from "fs";
 import path from "path";
+import { mastra } from "../..";
+import { 
+    getErrorMessage,
+    TestGenerationResultSchema,
+    RepoTestAnalysisSchema,
+    TestSpecificationSchema,
+    GitHubPullRequestSchema,
+} from "../../types";
 
 const ALERTS_ONLY = (process.env.ALERTS_ONLY === 'true') || (process.env.LOG_MODE === 'alerts_only') || (process.env.MASTRA_LOG_MODE === 'alerts_only');
+
+// Logger interface for type safety
+interface Logger {
+    info?: (message: string, meta?: Record<string, unknown>) => void;
+    debug?: (message: string, meta?: Record<string, unknown>) => void;
+    warn?: (message: string, meta?: Record<string, unknown>) => void;
+    error?: (message: string, meta?: Record<string, unknown>) => void;
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
 
 function sh(cmd: string): Promise<{ stdout: string; stderr: string }>{
     return new Promise((resolve, reject) => {
@@ -32,7 +52,7 @@ async function dockerExec(containerId: string, repoPath: string, command: string
     try {
         return await sh(fullCmd);
     } catch (error) {
-        throw new Error(`Docker exec failed: ${error instanceof Error ? error.message : String(error)}`);
+        throw new Error(`Docker exec failed: ${getErrorMessage(error)}`);
     }
 }
 
@@ -56,25 +76,29 @@ function getGithubTokenFromHost(): string | null {
     }
 }
 
-// ============================================================================
-// Step 1: Prepare git branch, commit changes, and push
-// ============================================================================
-export const prepareCommitAndPushStep = createStep({
-    id: "prepare-commit-and-push-step",
-    inputSchema: z.object({
+// =============================================================================
+// SCHEMAS
+// =============================================================================
+
+// Input schema for prepareCommitAndPushStep
+const PrepareCommitInputSchema = z.object({
         containerId: z.string().describe("Docker container ID"),
         repoPath: z.string().optional().describe("Absolute path to the repository inside the container"),
         projectId: z.string().describe("Project ID associated with this workflow run"),
         // Optional context from previous steps
-        testGeneration: z.any().optional(),
-        repoAnalysis: z.any().optional(),
-        testSpecs: z.any().optional(),
+    testGeneration: TestGenerationResultSchema.optional(),
+    repoAnalysis: RepoTestAnalysisSchema.optional(),
+    testSpecs: z.array(TestSpecificationSchema).optional(),
         result: z.string().optional(),
         success: z.boolean().optional(),
         toolCallCount: z.number().optional(),
         contextPath: z.string().optional(),
-    }),
-    outputSchema: z.object({
+});
+
+type PrepareCommitInput = z.infer<typeof PrepareCommitInputSchema>;
+
+// Output schema for prepareCommitAndPushStep
+const PrepareCommitOutputSchema = z.object({
         containerId: z.string(),
         repoPath: z.string(),
         branchName: z.string(),
@@ -83,16 +107,76 @@ export const prepareCommitAndPushStep = createStep({
         repoName: z.string(),
         commitMessage: z.string(),
         projectId: z.string(),
-        testGeneration: z.any().optional(),
-        repoAnalysis: z.any().optional(),
-        testSpecs: z.any().optional(),
+    testGeneration: TestGenerationResultSchema.optional(),
+    repoAnalysis: RepoTestAnalysisSchema.optional(),
+    testSpecs: z.array(TestSpecificationSchema).optional(),
+    result: z.string().optional(),
+    success: z.boolean().optional(),
+    toolCallCount: z.number().optional(),
+    contextPath: z.string().optional(),
+});
+
+type PrepareCommitOutput = z.infer<typeof PrepareCommitOutputSchema>;
+
+// Input schema for createPullRequestStep
+const CreatePullRequestInputSchema = PrepareCommitOutputSchema;
+type CreatePullRequestInput = z.infer<typeof CreatePullRequestInputSchema>;
+
+// Output schema for createPullRequestStep
+const CreatePullRequestOutputSchema = z.object({
+    prUrl: z.string(),
+    prNumber: z.number().optional(),
+    projectId: z.string(),
+    containerId: z.string(),
+    result: z.string().optional(),
+    success: z.boolean().optional(),
+    toolCallCount: z.number().optional(),
+    contextPath: z.string().optional(),
+});
+
+type CreatePullRequestOutput = z.infer<typeof CreatePullRequestOutputSchema>;
+
+// Input/Output schema for postPrUrlStep
+const PostPrUrlInputSchema = z.object({
+    prUrl: z.string(),
+    prNumber: z.number().optional(),
+    projectId: z.string(),
+    containerId: z.string(),
         result: z.string().optional(),
         success: z.boolean().optional(),
         toolCallCount: z.number().optional(),
         contextPath: z.string().optional(),
-    }),
-    execute: async ({ inputData, mastra, runId }) => {
-        const logger = ALERTS_ONLY ? null : mastra?.getLogger();
+});
+
+type PostPrUrlInput = z.infer<typeof PostPrUrlInputSchema>;
+
+// Workflow input schema
+const WorkflowInputSchema = z.object({
+    containerId: z.string(),
+    repoPath: z.string().optional(),
+    projectId: z.string(),
+    testGeneration: TestGenerationResultSchema.optional(),
+    repoAnalysis: RepoTestAnalysisSchema.optional(),
+    testSpecs: z.array(TestSpecificationSchema).optional(),
+    contextPath: z.string().optional(),
+});
+
+// Workflow output schema
+const WorkflowOutputSchema = z.object({
+    prUrl: z.string(),
+    projectId: z.string(),
+});
+
+// =============================================================================
+// Step 1: Prepare git branch, commit changes, and push
+// =============================================================================
+
+export const prepareCommitAndPushStep = createStep({
+    id: "prepare-commit-and-push-step",
+    inputSchema: PrepareCommitInputSchema,
+    outputSchema: PrepareCommitOutputSchema,
+    execute: async ({ inputData, mastra, runId }): Promise<PrepareCommitOutput> => {
+        const logger = ALERTS_ONLY ? null : mastra?.getLogger() as Logger | undefined;
         const { containerId } = inputData;
 
         await notifyStepStatus({
@@ -113,7 +197,7 @@ export const prepareCommitAndPushStep = createStep({
                 repoPath = stdout.trim() || "/app";
             }
         } catch (err) {
-            throw new Error(`Failed to resolve repoPath: ${err instanceof Error ? err.message : String(err)}`);
+            throw new Error(`Failed to resolve repoPath: ${getErrorMessage(err)}`);
         }
 
         // 2) Ensure git identity and fetch latest
@@ -122,7 +206,7 @@ export const prepareCommitAndPushStep = createStep({
             await dockerExec(containerId, repoPath, "git config user.name 'Mastra Bot'");
             await dockerExec(containerId, repoPath, "git fetch origin --prune");
         } catch (err) {
-            logger?.warn?.("Git setup failed", { error: err instanceof Error ? err.message : String(err) });
+            logger?.warn?.("Git setup failed", { error: getErrorMessage(err) });
         }
 
         // 3) Determine base branch priority: dev > develop > main > master > origin HEAD
@@ -144,189 +228,114 @@ export const prepareCommitAndPushStep = createStep({
                 }
             }
         } catch (err) {
-            logger?.warn?.("Base branch detection failed, using main", { error: err instanceof Error ? err.message : String(err) });
+            logger?.warn?.("Base branch detection failed, using main", { error: getErrorMessage(err) });
         }
 
         // 3.5) Empowered planning via githubPrAgent (uses docker_exec internally) to choose branch/base/message
-        let plannedBranchName: string | undefined;
-        let plannedBaseBranch: string | undefined;
-        let plannedCommitMessage: string | undefined;
+        let branchName = `mastra/unit-tests-${Date.now()}`;
+        let commitMessage = "Add unit tests";
+        let repoOwner = "";
+        let repoName = "";
+
         try {
-            const prAgent = mastra?.getAgent("githubPrAgent");
+            const prAgent = mastra?.getAgent?.("githubPrAgent");
             if (prAgent) {
-                const planPrompt = `CRITICAL: Return ONLY valid JSON. No explanations.
+                const testDir = inputData.repoAnalysis?.testDirectory || "tests";
+                const planPrompt = `You have docker_exec. containerId='${containerId}'. Repository at '${repoPath}'.
+TASK (strict JSON output): Analyse the repo and prepare a PR strategy.
+1. Run: cd ${repoPath} && git remote get-url origin
+2. Run: cd ${repoPath} && ls -la ${testDir} 2>/dev/null || echo "TEST_DIR_MISSING"
+3. Run: cd ${repoPath} && git branch -r
+4. Return JSON: {"baseBranch":"<branch>","branchName":"<new-branch>","commitMessage":"<msg>","repoOwner":"<owner>","repoName":"<repo>"}
+Do not return explanations. Only JSON.`;
 
-You have docker_exec. The repository is inside Docker container '${containerId}'.
-- Discover repo dir under /app with .git (default: ${repoPath}).
-- Inspect remote branches and recent commit subjects to infer style.
-- Pick base branch preferring: dev > develop > main > master > origin HEAD.
-- Propose a descriptive branch name for unit tests consistent with repo patterns.
-- Propose a concise commit message (single subject line OK) that reflects tests added.
-IMPORTANT: For EVERY git command, cd into the repo first. Always run commands as: cd <repoPath> && <git ...> (do not use git -C).
-
-Return JSON exactly:
-{
-  "repoPath": "...",
-  "branchName": "...",
-  "baseBranch": "...",
-  "commitMessage": "..."
-}`;
-                const planResult: any = await prAgent.generate(planPrompt, { maxSteps: 60, maxRetries: 1 });
-                const text = (planResult?.text || "{}").toString();
-                const md = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-                const jsonRaw = md ? md[1] : text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1);
-                const parsed = JSON.parse(jsonRaw);
-                if (parsed && typeof parsed === 'object') {
-                    if (typeof parsed.repoPath === 'string' && parsed.repoPath.trim()) repoPath = parsed.repoPath.trim();
-                    if (typeof parsed.branchName === 'string') plannedBranchName = parsed.branchName.trim();
-                    if (typeof parsed.baseBranch === 'string') plannedBaseBranch = parsed.baseBranch.trim();
-                    if (typeof parsed.commitMessage === 'string') plannedCommitMessage = parsed.commitMessage.trim();
-                }
-            }
-        } catch (e) {
-            // planning is best-effort; continue with heuristics
-            logger?.debug?.("PR planning via agent failed; using defaults", { error: e instanceof Error ? e.message : String(e) });
-        }
-        if (plannedBaseBranch) baseBranch = plannedBaseBranch;
-
-        // 4) Create a unique branch name and handle existing branches
-        const ts = new Date().toISOString().replace(/[-:TZ\.]/g, "").slice(0, 14);
-        const suffix = (runId || Math.random().toString(36).slice(2)).toString().slice(0, 8);
-        let branchName = plannedBranchName || `ai/tests/${ts}-${suffix}`;
-
-        try {
-            // Check if branch already exists remotely
-            let branchExists = false;
-            try {
-                await dockerExec(containerId, repoPath, `git ls-remote --heads origin ${branchName}`);
-                branchExists = true;
-                // If it exists, make it unique
-                branchName = `${branchName}-${Math.random().toString(36).slice(2, 8)}`;
-            } catch {
-                // Branch doesn't exist, proceed
-            }
-
-            // Ensure we have the latest base branch
-            await dockerExec(containerId, repoPath, `git fetch origin ${baseBranch}`);
-            
-            // Create branch from the latest base
-            await dockerExec(containerId, repoPath, `git checkout -B ${branchName} origin/${baseBranch}`);
-            
-        } catch (err) {
-            throw new Error(`Failed to create branch: ${err instanceof Error ? err.message : String(err)}`);
-        }
-
-        // 5) Stage changes (prefer tests directory if known)
-        try {
-            const testDir = (inputData as any)?.repoAnalysis?.testDirectory || "tests";
-            // Stage tests dir if exists, otherwise stage all
-            const { stdout: testDirExists } = await dockerExec(containerId, repoPath, `test -d ${testDir} && echo EXISTS || echo NO`);
-            if (testDirExists.trim() === "EXISTS") {
-                await dockerExec(containerId, repoPath, `git add -A -- ${testDir}`);
-            } else {
-                await dockerExec(containerId, repoPath, "git add -A");
-            }
-        } catch (err) {
-            throw new Error(`Failed to stage changes: ${err instanceof Error ? err.message : String(err)}`);
-        }
-
-        // 6) Check if there is anything to commit
-        const { stdout: statusOut } = await dockerExec(containerId, repoPath, "git status --porcelain");
-        if (!statusOut.trim()) {
-            // Nothing changed; still return repo info to allow next steps to no-op
-            const { stdout: remoteUrlRaw } = await dockerExec(containerId, repoPath, "git remote get-url origin");
-            const remoteUrl = remoteUrlRaw.trim();
-            const match = remoteUrl.match(/github\.com[:/]{1,2}([^/]+)\/([^\.]+)(?:\.git)?/);
-            const repoOwner = match?.[1] || "unknown";
-            const repoName = match?.[2] || "unknown";
-            const commitMessage = "No changes to commit";
-
-            await notifyStepStatus({
-                stepId: "prepare-commit-and-push-step",
-                status: "completed",
-                runId,
-                containerId,
-                projectId: inputData.projectId,
-                title: "No changes detected",
-                subtitle: "Skipping commit & push",
-                toolCallCount: cliToolMetrics.callCount,
-            });
-
-            return { containerId, repoPath, branchName, baseBranch, repoOwner, repoName, commitMessage, projectId: inputData.projectId };
-        }
-
-        // 7) Build commit message from available context
-        const tg = (inputData as any)?.testGeneration || {};
-        const testFiles = Array.isArray(tg.testFiles) ? tg.testFiles : tg?.summary?.totalTestFiles ? [`${tg.summary.totalTestFiles} file(s)`] : [];
-        const testsSummary = tg?.summary ? `functions: ${tg.summary.totalFunctions}, cases: ${tg.summary.totalTestCases}` : "generated tests";
-        const firstTestPath = Array.isArray(testFiles) && testFiles[0]?.testFile ? testFiles[0].testFile : (typeof testFiles[0] === 'string' ? testFiles[0] : "tests");
-        const shortTitle = `Add comprehensive unit tests (${testsSummary})`;
-        const bodyLine = `Include tests like ${firstTestPath} and related files.`;
-        const commitMessageCombined = plannedCommitMessage || `${shortTitle}\n\n${bodyLine}`;
-
-        // 7) Commit with proper escaping
-        try {
-            if (plannedCommitMessage) {
-                await dockerExec(containerId, repoPath, `git commit -m ${shellEscape(plannedCommitMessage)} --no-verify`);
-            } else {
-                await dockerExec(containerId, repoPath, `git commit -m ${shellEscape(shortTitle)} -m ${shellEscape(bodyLine)} --no-verify`);
-            }
-        } catch (err) {
-            // If commit fails, try recovery with single combined message
-            try {
-                await dockerExec(containerId, repoPath, `git add -A && git commit -m ${shellEscape(commitMessageCombined)} --no-verify`);
-            } catch (err2) {
-                logger?.warn?.("Commit attempt failed; will verify divergence and attempt recovery", { error: err2 instanceof Error ? err2.message : String(err2) });
-            }
-        }
-
-        // 8) Push branch with force-with-lease for safety
-        try {
-            // First try a normal push
-            await dockerExec(containerId, repoPath, `git push -u origin ${branchName}`);
-        } catch (err) {
-            const errorMsg = err instanceof Error ? err.message : String(err);
-            
-            // Handle non-fast-forward error specifically
-            if (errorMsg.includes('non-fast-forward') || errorMsg.includes('rejected')) {
-                logger?.warn?.("Push rejected, attempting to resolve conflicts", { branchName, baseBranch });
-                
-                try {
-                    // Fetch latest and try to rebase
-                    await dockerExec(containerId, repoPath, `git fetch origin ${branchName}`);
-                    
-                    // Check if remote branch exists and has commits
-                    const { stdout: remoteBranchInfo } = await dockerExec(containerId, repoPath, `git log --oneline origin/${branchName} 2>/dev/null | head -5`);
-                    
-                    if (remoteBranchInfo.trim()) {
-                        // Remote branch has commits, need to merge/rebase
-                        logger?.info?.("Remote branch has commits, rebasing local changes");
-                        await dockerExec(containerId, repoPath, `git rebase origin/${branchName}`);
-                        await dockerExec(containerId, repoPath, `git push origin ${branchName}`);
-                    } else {
-                        // Force push since remote might be in inconsistent state
-                        logger?.warn?.("Remote branch inconsistent, force pushing");
-                        await dockerExec(containerId, repoPath, `git push --force-with-lease origin ${branchName}`);
-                    }
-                } catch (recoveryErr) {
-                    // As last resort, try force push with lease
+                const planResult = await prAgent.generate(planPrompt, { maxSteps: 60, maxRetries: 1 });
+                const planResultObj = planResult as { text?: string };
+                const planText = planResultObj?.text || "";
+                const start = planText.indexOf('{');
+                const end = planText.lastIndexOf('}');
+                if (start !== -1 && end !== -1 && end > start) {
+                    const jsonText = planText.substring(start, end + 1);
                     try {
-                        await dockerExec(containerId, repoPath, `git push --force-with-lease origin ${branchName}`);
-                    } catch (forceErr) {
-                        throw new Error(`Failed to push after all recovery attempts: ${forceErr instanceof Error ? forceErr.message : String(forceErr)}`);
+                        const plan = JSON.parse(jsonText) as { 
+                            baseBranch?: string; 
+                            branchName?: string; 
+                            commitMessage?: string; 
+                            repoOwner?: string; 
+                            repoName?: string;
+                        };
+                        if (plan.baseBranch && typeof plan.baseBranch === 'string') baseBranch = plan.baseBranch;
+                        if (plan.branchName && typeof plan.branchName === 'string') branchName = plan.branchName;
+                        if (plan.commitMessage && typeof plan.commitMessage === 'string') commitMessage = plan.commitMessage;
+                        if (plan.repoOwner && typeof plan.repoOwner === 'string') repoOwner = plan.repoOwner;
+                        if (plan.repoName && typeof plan.repoName === 'string') repoName = plan.repoName;
+                    } catch {
+                        // ignore JSON parse errors
                     }
                 }
-            } else {
-                throw new Error(`Failed to push branch: ${errorMsg}`);
+            }
+        } catch {
+            // fallback to manual extraction
+        }
+
+        // Extract owner/repo from remote URL if not determined by agent
+        if (!repoOwner || !repoName) {
+            try {
+                const { stdout: url } = await dockerExec(containerId, repoPath, "git remote get-url origin");
+                // Handle https://github.com/owner/repo.git or git@github.com:owner/repo.git
+                const m = url.match(/github\.com[:/]([^/]+)\/([^/\s]+?)(\.git)?$/);
+                if (m) {
+                    repoOwner = m[1];
+                    repoName = m[2].replace(/\.git$/, '');
+                }
+            } catch {
+                // fallback
             }
         }
 
-        // 9) Extract repo owner/name from origin
-        const { stdout: remoteUrlOut } = await dockerExec(containerId, repoPath, "git remote get-url origin");
-        const remoteUrl = remoteUrlOut.trim();
-        const match = remoteUrl.match(/github\.com[:/]{1,2}([^/]+)\/([^\.]+)(?:\.git)?/);
-        const repoOwner = match?.[1] || "unknown";
-        const repoName = match?.[2] || "unknown";
+        if (!repoOwner || !repoName) {
+            throw new Error("Unable to determine repository owner/name from git remote");
+        }
+
+        // 4) Checkout base branch, create new branch, stage and commit
+        try {
+            await dockerExec(containerId, repoPath, `git checkout ${baseBranch}`);
+            await dockerExec(containerId, repoPath, `git pull origin ${baseBranch}`).catch(() => {});
+            await dockerExec(containerId, repoPath, `git checkout -b ${branchName}`);
+            await dockerExec(containerId, repoPath, "git add -A");
+            const { stdout: statusCheck } = await dockerExec(containerId, repoPath, "git status --porcelain");
+            if (statusCheck.trim()) {
+                await dockerExec(containerId, repoPath, `git commit -m ${shellEscape(commitMessage)} --no-verify`);
+            }
+        } catch (err) {
+            logger?.warn?.("Branch preparation failed (may already exist)", { error: getErrorMessage(err) });
+            // try alternative: just commit on current branch or create fresh
+            try {
+                await dockerExec(containerId, repoPath, `git checkout -B ${branchName}`);
+                await dockerExec(containerId, repoPath, "git add -A");
+                await dockerExec(containerId, repoPath, `git commit -m ${shellEscape(commitMessage)} --allow-empty --no-verify`);
+            } catch {
+                // best-effort
+            }
+        }
+
+        // 5) Push to remote
+        const token = getGithubTokenFromHost();
+        if (token) {
+            try {
+                await dockerExec(containerId, repoPath, `git remote set-url origin https://x-access-token:${token}@github.com/${repoOwner}/${repoName}.git`);
+                await dockerExec(containerId, repoPath, `git push -u origin ${branchName} --force-with-lease`);
+        } catch (err) {
+                logger?.warn?.("Push failed, trying force push", { error: getErrorMessage(err) });
+                try {
+                    await dockerExec(containerId, repoPath, `git push -u origin ${branchName} --force`);
+                    } catch (forceErr) {
+                    throw new Error(`Failed to push branch: ${getErrorMessage(forceErr)}`);
+                }
+            }
+        } else {
+            throw new Error("GitHub token not found. Cannot push.");
+        }
 
         await notifyStepStatus({
             stepId: "prepare-commit-and-push-step",
@@ -334,7 +343,7 @@ Return JSON exactly:
             runId,
             containerId,
             projectId: inputData.projectId,
-            title: "Committed & pushed branch",
+            title: "Branch pushed",
             subtitle: `${branchName} -> ${baseBranch}`,
             toolCallCount: cliToolMetrics.callCount,
         });
@@ -346,53 +355,29 @@ Return JSON exactly:
             baseBranch, 
             repoOwner, 
             repoName, 
-            commitMessage: commitMessageCombined, 
+            commitMessage,
             projectId: inputData.projectId,
-            testGeneration: (inputData as any)?.testGeneration,
-            repoAnalysis: (inputData as any)?.repoAnalysis,
-            testSpecs: (inputData as any)?.testSpecs,
-            result: (inputData as any)?.result,
-            success: (inputData as any)?.success,
-            toolCallCount: (inputData as any)?.toolCallCount,
-            contextPath: (inputData as any)?.contextPath,
+            testGeneration: inputData.testGeneration,
+            repoAnalysis: inputData.repoAnalysis,
+            testSpecs: inputData.testSpecs,
+            result: inputData.result,
+            success: inputData.success,
+            toolCallCount: inputData.toolCallCount,
+            contextPath: inputData.contextPath,
         };
     },
 });
 
-// ============================================================================
+// =============================================================================
 // Step 2: Create Pull Request via GitHub API
-// ============================================================================
+// =============================================================================
+
 export const createPullRequestStep = createStep({
     id: "create-pull-request-step",
-    inputSchema: z.object({
-        containerId: z.string(),
-        repoPath: z.string(),
-        branchName: z.string(),
-        baseBranch: z.string(),
-        repoOwner: z.string(),
-        repoName: z.string(),
-        commitMessage: z.string(),
-        projectId: z.string(),
-        testGeneration: z.any().optional(),
-        repoAnalysis: z.any().optional(),
-        testSpecs: z.any().optional(),
-        contextPath: z.string().optional(),
-        result: z.string().optional(),
-        success: z.boolean().optional(),
-        toolCallCount: z.number().optional(),
-    }),
-    outputSchema: z.object({
-        prUrl: z.string(),
-        prNumber: z.number().optional(),
-        projectId: z.string(),
-        containerId: z.string(),
-        result: z.string().optional(),
-        success: z.boolean().optional(),
-        toolCallCount: z.number().optional(),
-        contextPath: z.string().optional(),
-    }),
-    execute: async ({ inputData, mastra, runId }) => {
-        const logger = ALERTS_ONLY ? null : mastra?.getLogger();
+    inputSchema: CreatePullRequestInputSchema,
+    outputSchema: CreatePullRequestOutputSchema,
+    execute: async ({ inputData, mastra, runId }): Promise<CreatePullRequestOutput> => {
+        const logger = ALERTS_ONLY ? null : mastra?.getLogger() as Logger | undefined;
         const token = getGithubTokenFromHost();
         if (!token) {
             throw new Error("GitHub token not found. Ensure .docker.credentials or env GITHUB_PAT exists.");
@@ -409,10 +394,10 @@ export const createPullRequestStep = createStep({
         });
 
         // Compose PR title and body
-        const tg = (inputData as any)?.testGeneration || {};
-        const qa = tg?.quality || {};
-        const summary = tg?.summary || {};
-        const testFile = Array.isArray(tg?.testFiles) && tg?.testFiles[0]?.testFile ? tg.testFiles[0].testFile : undefined;
+        const tg = inputData.testGeneration;
+        const qa = tg?.quality;
+        const summary = tg?.summary;
+        const testFile = tg?.testFiles?.[0]?.testFile;
         const functionsCount = summary?.totalFunctions ?? 0;
         const casesCount = summary?.totalTestCases ?? 0;
         const syntaxValid = qa?.syntaxValid === true;
@@ -421,9 +406,11 @@ export const createPullRequestStep = createStep({
 
         const title = `Add high-quality unit tests (${functionsCount} functions, ${casesCount} cases)`;
 
-        const spec = (inputData as any)?.testSpecs?.[0] || {};
+        const spec = inputData.testSpecs?.[0];
         const sourceFile = spec?.sourceFile || "[unknown source]";
-        const specFunctions = Array.isArray(spec?.functions) ? spec.functions.map((f: any) => `- ${f.name}: ${Array.isArray(f.testCases) ? f.testCases.length : 0} cases`).join("\n") : "- [spec not available]";
+        const specFunctions = spec?.functions 
+            ? spec.functions.map(f => `- ${f.name}: ${Array.isArray(f.testCases) ? f.testCases.length : 0} cases`).join("\n")
+            : "- [spec not available]";
 
         const body = [
 `## What
@@ -502,23 +489,22 @@ ${specFunctions}`,
 
         if (!res.ok) {
             const text = await res.text().catch(() => "");
-            const isNoCommits = res.status === 422 && /No commits between/i.test(text);
-            if (isNoCommits) {
-                // Senior-style auto-recovery: ensure at least one commit exists on remote head
+            // Handle 422 (Unprocessable Entity) which often means "no commits"
+            if (res.status === 422 && text.toLowerCase().includes("no commits")) {
+                logger?.warn?.("PR creation returned 422 with no commits – attempting recovery push", { 
+                    status: res.status, 
+                    text: text.substring(0, 500), 
+                    type: "GITHUB_API", 
+                    runId 
+                });
                 try {
-                    // Stage and commit if needed; if nothing to commit, create an empty commit as last resort
+                    // Force push an empty commit to ensure branch diverges from base
+                    await dockerExec(inputData.containerId, inputData.repoPath, `git checkout ${inputData.branchName}`);
                     await dockerExec(inputData.containerId, inputData.repoPath, "git add -A");
-                    try {
-                        await dockerExec(inputData.containerId, inputData.repoPath, `git commit -m ${shellEscape(inputData.commitMessage || title)} --no-verify`);
-                    } catch {
-                        await dockerExec(inputData.containerId, inputData.repoPath, `git commit --allow-empty -m ${shellEscape(inputData.commitMessage || title)} --no-verify`);
-                    }
-                    await dockerExec(inputData.containerId, inputData.repoPath, `git push -u origin ${inputData.branchName}`);
+                    await dockerExec(inputData.containerId, inputData.repoPath, `git commit --allow-empty -m ${shellEscape("chore: initialize PR branch")} --no-verify`);
+                    await dockerExec(inputData.containerId, inputData.repoPath, `git push origin ${inputData.branchName} --force`);
 
-                    // Small fetch to let GitHub register the new head
-                    await dockerExec(inputData.containerId, inputData.repoPath, `git fetch origin ${inputData.branchName} --quiet || true`);
-
-                    // Retry PR creation once
+                    // Retry PR creation
                     const retry = await fetch(url, {
                         method: 'POST',
                         headers: {
@@ -534,14 +520,12 @@ ${specFunctions}`,
                             maintainer_can_modify: true,
                         }),
                     });
-                    if (!retry.ok) {
-                        const retryText = await retry.text().catch(() => "");
-                        throw new Error(`Failed to create PR after recovery: ${retry.status} ${retryText}`);
-                    }
-                    // Overwrite res/pr with retry
-                    const prRetry = await retry.json() as any;
-                    const prUrlRetry = prRetry?.html_url || `https://github.com/${inputData.repoOwner}/${inputData.repoName}/pulls`;
-                    const prNumberRetry = prRetry?.number;
+
+                    if (retry.ok) {
+                        const prRetryResult = GitHubPullRequestSchema.safeParse(await retry.json());
+                        const prRetry = prRetryResult.success ? prRetryResult.data : { html_url: "", number: undefined };
+                        const prUrlRetry = prRetry.html_url || `https://github.com/${inputData.repoOwner}/${inputData.repoName}/pulls`;
+                        const prNumberRetry = prRetry.number;
 
                     await notifyStepStatus({
                         stepId: "create-pull-request-step",
@@ -559,23 +543,29 @@ ${specFunctions}`,
                         prNumber: prNumberRetry,
                         projectId: inputData.projectId,
                         containerId: inputData.containerId,
-                        result: (inputData as any)?.result,
-                        success: (inputData as any)?.success,
-                        toolCallCount: (inputData as any)?.toolCallCount,
-                        contextPath: (inputData as any)?.contextPath,
-                    };
+                            result: inputData.result,
+                            success: inputData.success,
+                            toolCallCount: inputData.toolCallCount,
+                            contextPath: inputData.contextPath,
+                        };
+                    } else {
+                        const retryText = await retry.text().catch(() => "");
+                        throw new Error(`PR creation failed after recovery: ${retry.status} ${retryText}`);
+                    }
                 } catch (recoveryErr) {
-                    throw new Error(`PR creation failed with 422 (no commits). Recovery attempt also failed: ${recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr)}`);
+                    throw new Error(`PR creation failed with 422 (no commits). Recovery attempt also failed: ${getErrorMessage(recoveryErr)}`);
                 }
             }
             throw new Error(`Failed to create PR: ${res.status} ${text}`);
         }
 
-        const pr = await res.json() as any;
-        const prUrl = pr?.html_url || `https://github.com/${inputData.repoOwner}/${inputData.repoName}/pulls`;
-        const prNumber = pr?.number;
+        const prResult = GitHubPullRequestSchema.safeParse(await res.json());
+        const pr = prResult.success ? prResult.data : { html_url: "", number: undefined };
+        const prUrl = pr.html_url || `https://github.com/${inputData.repoOwner}/${inputData.repoName}/pulls`;
+        const prNumber = pr.number;
 
         // Optionally add initial comment with a concise summary
+        if (prNumber) {
         try {
             const commentUrl = `https://api.github.com/repos/${inputData.repoOwner}/${inputData.repoName}/issues/${prNumber}/comments`;
             const commentBody = [
@@ -595,6 +585,7 @@ ${specFunctions}`,
             });
         } catch {
             // best effort
+            }
         }
 
         await notifyStepStatus({
@@ -613,39 +604,24 @@ ${specFunctions}`,
             prNumber, 
             projectId: inputData.projectId,
             containerId: inputData.containerId,
-            result: (inputData as any)?.result,
-            success: (inputData as any)?.success,
-            toolCallCount: (inputData as any)?.toolCallCount,
-            contextPath: (inputData as any)?.contextPath,
+            result: inputData.result,
+            success: inputData.success,
+            toolCallCount: inputData.toolCallCount,
+            contextPath: inputData.contextPath,
         };
     },
 });
 
-// ============================================================================
+// =============================================================================
 // Step 3: Post PR URL to backend
-// ============================================================================
+// =============================================================================
+
 export const postPrUrlStep = createStep({
     id: "post-pr-url-step",
-    inputSchema: z.object({
-        prUrl: z.string(),
-        projectId: z.string(),
-        containerId: z.string(),
-        result: z.string().optional(),
-        success: z.boolean().optional(),
-        toolCallCount: z.number().optional(),
-        contextPath: z.string().optional(),
-    }),
-    outputSchema: z.object({
-        prUrl: z.string(),
-        projectId: z.string(),
-        containerId: z.string(),
-        result: z.string().optional(),
-        success: z.boolean().optional(),
-        toolCallCount: z.number().optional(),
-        contextPath: z.string().optional(),
-    }),
-    execute: async ({ inputData, mastra, runId }) => {
-        const logger = ALERTS_ONLY ? null : mastra?.getLogger();
+    inputSchema: PostPrUrlInputSchema,
+    outputSchema: PostPrUrlInputSchema,
+    execute: async ({ inputData, mastra, runId }): Promise<PostPrUrlInput> => {
+        const logger = ALERTS_ONLY ? null : mastra?.getLogger() as Logger | undefined;
         const baseUrl = process.env.BASE_URL || 'http://localhost:3000';
         const url = `${baseUrl}/api/projects/${inputData.projectId}/pr-url`;
 
@@ -660,7 +636,7 @@ export const postPrUrlStep = createStep({
         });
 
         try {
-            logger?.debug("Posting PR URL to backend", { url, prUrl: inputData.prUrl, projectId: inputData.projectId, type: "BACKEND_POST", runId });
+            logger?.debug?.("Posting PR URL to backend", { url, prUrl: inputData.prUrl, projectId: inputData.projectId, type: "BACKEND_POST", runId });
             const res = await fetch(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -669,10 +645,10 @@ export const postPrUrlStep = createStep({
             const ok = res.ok;
             if (!ok) {
                 const text = await res.text().catch(() => "");
-                logger?.warn("Backend returned non-2xx for PR URL", { status: res.status, text: text.substring(0, 300), type: "BACKEND_POST", runId });
+                logger?.warn?.("Backend returned non-2xx for PR URL", { status: res.status, text: text.substring(0, 300), type: "BACKEND_POST", runId });
             }
         } catch (err) {
-            logger?.warn("Failed to POST PR URL", { error: err instanceof Error ? err.message : String(err), type: "BACKEND_POST", runId });
+            logger?.warn?.("Failed to POST PR URL", { error: getErrorMessage(err), type: "BACKEND_POST", runId });
         }
 
         await notifyStepStatus({
@@ -688,39 +664,28 @@ export const postPrUrlStep = createStep({
 
         return { 
             prUrl: inputData.prUrl, 
+            prNumber: inputData.prNumber,
             projectId: inputData.projectId,
             containerId: inputData.containerId,
-            result: (inputData as any)?.result,
-            success: (inputData as any)?.success,
-            toolCallCount: (inputData as any)?.toolCallCount,
-            contextPath: (inputData as any)?.contextPath,
+            result: inputData.result,
+            success: inputData.success,
+            toolCallCount: inputData.toolCallCount,
+            contextPath: inputData.contextPath,
         };
     },
 });
 
-// ============================================================================
+// =============================================================================
 // Standalone Workflow (04)
-// ============================================================================
+// =============================================================================
+
 export const githubPrWorkflow = createWorkflow({
     id: "github-pr-workflow",
     description: "Commit generated tests to a branch and open a GitHub PR, then report URL",
-    inputSchema: z.object({
-        containerId: z.string(),
-        repoPath: z.string().optional(),
-        projectId: z.string(),
-        testGeneration: z.any().optional(),
-        repoAnalysis: z.any().optional(),
-        testSpecs: z.any().optional(),
-        contextPath: z.string().optional(),
-    }),
-    outputSchema: z.object({
-        prUrl: z.string(),
-        projectId: z.string(),
-    }),
+    inputSchema: WorkflowInputSchema,
+    outputSchema: WorkflowOutputSchema,
 })
-.then(prepareCommitAndPushStep as any)
-.then(createPullRequestStep as any)
-.then(postPrUrlStep as any)
+.then(prepareCommitAndPushStep)
+.then(createPullRequestStep)
+.then(postPrUrlStep)
 .commit();
-
-

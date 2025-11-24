@@ -42,11 +42,11 @@ OUTPUT REQUIREMENTS:
 - Estimated complexity and effort
 
 Focus on creating thorough, well-organized test specifications that ensure complete coverage.`,
-    // model: openai("gpt-5-mini", {
-    //     parallelToolCalls: true,
-    //     reasoningEffort: "high",
-    // }),
-    model: groq('openai/gpt-oss-120b'),
+    model: openai("gpt-5.1", {
+        parallelToolCalls: true,
+        reasoningEffort: "high",
+    }),
+    // model: groq('openai/gpt-oss-120b'),
 
     tools: {
         exec_command: cliTool,

@@ -104,10 +104,10 @@ export const mastra = new Mastra({
               try {
                 console.log(`[start-full-pipeline] Starting run ${run.runId}`);
                 run.start({ inputData: { contextData, projectId } })
-                  .then((result: any) => {
+                  .then((result: { status?: string }) => {
                     console.log(`[start-full-pipeline] Run ${run.runId} completed with status: ${result.status}`);
                   })
-                  .catch((err: any) => {
+                  .catch((err: unknown) => {
                     console.error(`[start-full-pipeline] Run ${run.runId} failed:`, err);
                   });
               } catch (err) {

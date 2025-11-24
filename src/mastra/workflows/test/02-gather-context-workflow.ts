@@ -7,284 +7,267 @@ import { writeFileSync, unlinkSync, mkdtempSync } from "fs";
 import path from "path";
 import os from "os";
 import { notifyStepStatus } from "../../tools/alert-notifier";
+import {
+    getErrorMessage,
+    extractJsonFromText,
+    attemptJsonRecovery,
+    RepositoryStructureSchema,
+    CodebaseAnalysisSchema,
+    BuildAndDeploymentSchema,
+    RepoContextSchema,
+    type PackageType,
+    type CodeCommentsLevel,
+    type RepositoryType,
+} from "../../types";
 
 const ALERTS_ONLY = (process.env.ALERTS_ONLY === 'true') || (process.env.LOG_MODE === 'alerts_only') || (process.env.MASTRA_LOG_MODE === 'alerts_only');
 
-// Input schema - what we start with
-const WorkflowInput = z.object({
+// =============================================================================
+// STEP INPUT/OUTPUT SCHEMAS
+// =============================================================================
+
+// Input schema - what we start with (includes optional repoPath from previous workflow)
+const WorkflowInputSchema = z.object({
     containerId: z.string(),
     repoPath: z.string().optional(),
     projectId: z.string().describe("Project ID associated with this workflow run"),
 });
 
-// Repository structure schema
-const RepositoryStructure = z.object({
-    type: z.enum(["monorepo", "single-package", "multi-project"]),
-    rootPath: z.string(),
-    gitStatus: z.object({
-        isGitRepo: z.boolean(),
-        defaultBranch: z.string().nullable(),
-        lastCommit: z.string().nullable(),
-        hasRemote: z.boolean(),
-        isDirty: z.boolean(),
-    }),
-    structure: z.object({
-        packages: z.array(z.object({
-            path: z.string(),
-            name: z.string().nullable(),
-            type: z.enum(["app", "library", "tool", "config", "unknown"]),
-            language: z.string().nullable(),
-        })),
-        keyDirectories: z.array(z.string()),
-        ignoredPaths: z.array(z.string()),
-    }),
-    languages: z.array(z.object({
-        language: z.string(),
-        percentage: z.number(),
-        fileCount: z.number(),
-        mainFiles: z.array(z.string()),
-    })),
+type WorkflowInput = z.infer<typeof WorkflowInputSchema>;
+
+// Step output schemas
+const AnalyzeRepositoryOutputSchema = z.object({
+    containerId: z.string(),
+    repository: RepositoryStructureSchema,
+    projectId: z.string(),
 });
 
-const CodebaseAnalysis = z.object({
-    architecture: z.object({
-        pattern: z.string().describe("Overall architectural pattern (MVC, microservices, etc.)"),
-        entryPoints: z.array(z.string()),
-        mainModules: z.array(z.object({ path: z.string(), purpose: z.string() })),
-        dependencies: z.object({
-            internal: z.array(z.object({ from: z.string(), to: z.string(), type: z.string() })),
-            external: z.record(z.string()),
-            keyLibraries: z.array(z.object({ name: z.string(), purpose: z.string(), version: z.string().nullable() })),
-        }),
-    }),
-    codeQuality: z.object({
-        hasTests: z.boolean(),
-        testCoverage: z.string().nullable(),
-        linting: z.array(z.string()),
-        formatting: z.array(z.string()),
-        documentation: z.object({
-            hasReadme: z.boolean(),
-            hasApiDocs: z.boolean(),
-            codeComments: z.enum(["extensive", "moderate", "minimal", "none"]),
-        }),
-    }),
-    frameworks: z.array(z.object({
-        name: z.string(),
-        version: z.string().nullable(),
-        purpose: z.string(),
-        configFiles: z.array(z.string()),
-    })),
+const AnalyzeCodebaseOutputSchema = z.object({
+    containerId: z.string(),
+    codebase: CodebaseAnalysisSchema,
+    projectId: z.string(),
 });
 
-const BuildAndDeployment = z.object({
-    buildSystem: z.object({
-        type: z.string().nullable(),
-        configFiles: z.array(z.string()),
-        buildCommands: z.array(z.string()),
-        buildAttempts: z.array(z.object({
-            command: z.string(),
-            success: z.boolean(),
-            output: z.string(),
-            issues: z.array(z.string()),
-        })),
-    }),
-    packageManagement: z.object({
-        managers: z.array(z.string()),
-        lockFiles: z.array(z.string()),
-        workspaceConfig: z.string().nullable(),
-    }),
-    testing: z.object({
-        frameworks: z.array(z.string()),
-        testDirs: z.array(z.string()),
-        testCommands: z.array(z.string()),
-        testAttempts: z.array(z.object({
-            command: z.string(),
-            success: z.boolean(),
-            output: z.string(),
-        })),
-    }),
-    deployment: z.object({
-        cicd: z.array(z.string()),
-        dockerfiles: z.array(z.string()),
-        deploymentConfigs: z.array(z.string()),
-        environmentConfig: z.object({
-            envFiles: z.array(z.string()),
-            requiredVars: z.array(z.string()),
-        }),
-    }),
+const AnalyzeBuildDeploymentOutputSchema = z.object({
+    containerId: z.string(),
+    buildDeploy: BuildAndDeploymentSchema,
+    projectId: z.string(),
 });
 
-const RepoContext = z.object({
-    repository: RepositoryStructure,
-    codebase: CodebaseAnalysis,
-    buildDeploy: BuildAndDeployment,
-    insights: z.object({
-        complexity: z.enum(["simple", "moderate", "complex", "very-complex"]),
-        maturity: z.enum(["prototype", "development", "production", "mature"]),
-        maintainability: z.enum(["excellent", "good", "fair", "poor"]),
-        recommendations: z.array(z.string()),
-        potentialIssues: z.array(z.string()),
-        strengthsWeaknesses: z.object({
-            strengths: z.array(z.string()),
-            weaknesses: z.array(z.string()),
-        }),
-    }),
-    confidence: z.object({
-        repository: z.number(),
-        codebase: z.number(),
-        buildDeploy: z.number(),
-        overall: z.number(),
-    }),
-    executiveSummary: z.string().describe("2-3 paragraph summary as a senior engineer would write"),
+const SynthesizeContextOutputSchema = RepoContextSchema.extend({
+    containerId: z.string(),
+    projectId: z.string(),
 });
 
-// Helper to call the Context Agent with comprehensive analysis
-function normalizeAgentJsonForSchemas(input: any): any {
+const SaveContextOutputSchema = z.object({
+    containerId: z.string(),
+    contextPath: z.string(),
+    repoContext: RepoContextSchema,
+    projectId: z.string(),
+});
+
+const ValidateOutputSchema = z.object({
+    result: z.string(),
+    success: z.boolean(),
+    toolCallCount: z.number(),
+    contextPath: z.string(),
+    repoContext: RepoContextSchema,
+    projectId: z.string(),
+});
+
+// Parallel analysis input schema
+const ParallelAnalysisInputSchema = z.object({
+    "analyze-repository-step": AnalyzeRepositoryOutputSchema,
+    "analyze-codebase-step": AnalyzeCodebaseOutputSchema,
+    "analyze-build-deployment-step": AnalyzeBuildDeploymentOutputSchema,
+});
+
+// =============================================================================
+// LOGGER TYPE
+// =============================================================================
+
+interface Logger {
+    info?: (message: string, meta?: Record<string, unknown>) => void;
+    debug?: (message: string, meta?: Record<string, unknown>) => void;
+    warn?: (message: string, meta?: Record<string, unknown>) => void;
+    error?: (message: string, meta?: Record<string, unknown>) => void;
+}
+
+// =============================================================================
+// NORMALIZATION HELPERS
+// =============================================================================
+
+interface DocumentationInput {
+    hasReadme?: unknown;
+    hasApiDocs?: unknown;
+    codeComments?: unknown;
+}
+
+interface PackageInput {
+    path?: unknown;
+    name?: unknown;
+    type?: unknown;
+    language?: unknown;
+}
+
+interface RepositoryInput {
+    type?: unknown;
+    structure?: {
+        packages?: PackageInput[];
+    };
+    gitStatus?: unknown;
+}
+
+interface NormalizableInput {
+    codeQuality?: {
+        documentation?: DocumentationInput;
+    };
+    codebase?: {
+        codeQuality?: {
+            documentation?: DocumentationInput;
+        };
+    };
+    repository?: RepositoryInput;
+    gitStatus?: unknown;
+    structure?: {
+        packages?: PackageInput[];
+    };
+}
+
+const allowedComments = new Set<CodeCommentsLevel>(["extensive", "moderate", "minimal", "none"]);
+const allowedRepoTypes = new Set<RepositoryType>(["monorepo", "single-package", "multi-project"]);
+const allowedPackageTypes = new Set<PackageType>(["app", "library", "tool", "config", "unknown"]);
+
+function normalizeDoc(doc: DocumentationInput): void {
+    if (!doc || typeof doc !== "object") return;
+    const hasReadmeVal = doc.hasReadme;
+    const hasApiDocsVal = doc.hasApiDocs;
+    doc.hasReadme = hasReadmeVal === null || hasReadmeVal === undefined ? false : Boolean(hasReadmeVal);
+    doc.hasApiDocs = hasApiDocsVal === null || hasApiDocsVal === undefined ? false : Boolean(hasApiDocsVal);
+
+    const commentsVal = typeof doc.codeComments === "string" ? doc.codeComments.trim().toLowerCase() : undefined;
+    doc.codeComments = commentsVal && allowedComments.has(commentsVal as CodeCommentsLevel) ? commentsVal : "none";
+}
+
+function normalizeRepoType(value: unknown): RepositoryType {
+    if (typeof value !== "string") return "single-package";
+    const v = value.trim().toLowerCase().replace(/\s+/g, "-");
+    if (allowedRepoTypes.has(v as RepositoryType)) return v as RepositoryType;
+    if (v.includes("mono")) return "monorepo";
+    if (v.includes("multi")) return "multi-project";
+    return "single-package";
+}
+
+function normalizePackageType(value: unknown): PackageType {
+    if (typeof value !== "string") return "unknown";
+    const v = value.trim().toLowerCase();
+    if (allowedPackageTypes.has(v as PackageType)) return v as PackageType;
+    if (v.includes("lib")) return "library";
+    if (v.includes("app")) return "app";
+    if (v.includes("tool")) return "tool";
+    if (v.includes("config") || v.includes("cfg")) return "config";
+    return "unknown";
+}
+
+function normalizeRepositoryShape(repo: RepositoryInput): void {
+    if (!repo || typeof repo !== "object") return;
+    if (repo.type !== undefined) {
+        repo.type = normalizeRepoType(repo.type);
+    }
+    if (repo.structure && Array.isArray(repo.structure.packages)) {
+        repo.structure.packages = repo.structure.packages.map((pkg: PackageInput) => ({
+            path: typeof pkg.path === "string" ? pkg.path : String(pkg.path || "."),
+            name: typeof pkg.name === "string" ? pkg.name : (pkg.name == null ? null : String(pkg.name)),
+            type: normalizePackageType(pkg.type),
+            language: typeof pkg.language === "string" ? pkg.language : (pkg.language == null ? null : String(pkg.language)),
+        }));
+    }
+}
+
+function normalizeAgentJsonForSchemas<T>(input: T): T {
     try {
-        const allowedComments = new Set(["extensive", "moderate", "minimal", "none"]);
-        const allowedRepoTypes = new Set(["monorepo", "single-package", "multi-project"]);
-        const allowedPackageTypes = new Set(["app", "library", "tool", "config", "unknown"]);
-
-        const normalizeDoc = (doc: any) => {
-            if (!doc || typeof doc !== "object") return;
-            const hasReadmeVal = doc.hasReadme;
-            const hasApiDocsVal = doc.hasApiDocs;
-            doc.hasReadme = hasReadmeVal === null || hasReadmeVal === undefined ? false : Boolean(hasReadmeVal);
-            doc.hasApiDocs = hasApiDocsVal === null || hasApiDocsVal === undefined ? false : Boolean(hasApiDocsVal);
-
-            const commentsVal = typeof doc.codeComments === "string" ? doc.codeComments.trim().toLowerCase() : undefined;
-            doc.codeComments = commentsVal && allowedComments.has(commentsVal) ? commentsVal : "none";
-        };
-
-        const normalizeRepoType = (value: any): string => {
-            if (typeof value !== "string") return "single-package";
-            const v = value.trim().toLowerCase().replace(/\s+/g, "-");
-            if (allowedRepoTypes.has(v)) return v;
-            if (v.includes("mono")) return "monorepo";
-            if (v.includes("multi")) return "multi-project";
-            return "single-package";
-        };
-
-        const normalizePackageType = (value: any): "app" | "library" | "tool" | "config" | "unknown" => {
-            if (typeof value !== "string") return "unknown";
-            const v = value.trim().toLowerCase();
-            if (allowedPackageTypes.has(v)) return v as any;
-            if (v.includes("lib")) return "library";
-            if (v.includes("app")) return "app";
-            if (v.includes("tool")) return "tool";
-            if (v.includes("config") || v.includes("cfg")) return "config";
-            return "unknown";
-        };
-
-        const normalizeRepositoryShape = (repo: any) => {
-            if (!repo || typeof repo !== "object") return;
-            if (repo.type !== undefined) {
-                repo.type = normalizeRepoType(repo.type);
-            }
-            if (repo.structure && Array.isArray(repo.structure.packages)) {
-                repo.structure.packages = repo.structure.packages.map((pkg: any) => {
-                    const normalized: any = { ...pkg };
-                    normalized.path = typeof pkg.path === "string" ? pkg.path : String(pkg.path || ".");
-                    normalized.name = typeof pkg.name === "string" ? pkg.name : (pkg.name == null ? null : String(pkg.name));
-                    normalized.type = normalizePackageType(pkg.type);
-                    normalized.language = typeof pkg.language === "string" ? pkg.language : (pkg.language == null ? null : String(pkg.language));
-                    return normalized;
-                });
-            }
-        };
-
+        const data = input as NormalizableInput;
+        
         // Direct CodebaseAnalysis shape
-        if (input && input.codeQuality && input.codeQuality.documentation) {
-            normalizeDoc(input.codeQuality.documentation);
+        if (data && data.codeQuality && data.codeQuality.documentation) {
+            normalizeDoc(data.codeQuality.documentation);
         }
 
         // RepoContext shape with nested CodebaseAnalysis
-        if (input && input.codebase && input.codebase.codeQuality && input.codebase.codeQuality.documentation) {
-            normalizeDoc(input.codebase.codeQuality.documentation);
+        if (data && data.codebase && data.codebase.codeQuality && data.codebase.codeQuality.documentation) {
+            normalizeDoc(data.codebase.codeQuality.documentation);
         }
 
         // Direct RepositoryStructure shape
-        if (input && input.gitStatus && input.structure) {
-            normalizeRepositoryShape(input);
+        if (data && data.gitStatus && data.structure) {
+            normalizeRepositoryShape(data as unknown as RepositoryInput);
         }
 
         // RepoContext shape with nested RepositoryStructure
-        if (input && input.repository) {
-            normalizeRepositoryShape(input.repository);
+        if (data && data.repository) {
+            normalizeRepositoryShape(data.repository);
         }
     } catch {
         // best-effort normalization; ignore errors
     }
     return input;
 }
+
+// =============================================================================
+// AGENT HELPER FUNCTIONS
+// =============================================================================
+
 async function callContextAgentForAnalysis<T>(
     prompt: string, 
     schema: z.ZodType<T>, 
     maxSteps: number = 50,
     runId?: string,
-    logger?: any
+    logger?: Logger | null
 ): Promise<T> {
     const agent = mastra?.getAgent("contextAgent");
     if (!agent) throw new Error("Context agent not found");
     
-    logger?.debug("🤖 Invoking context agent", {
+    logger?.debug?.("🤖 Invoking context agent", {
         promptLength: prompt.length,
         maxSteps,
-        schemaName: (schema as any)._def?.typeName || 'unknown',
         type: "AGENT_CALL",
         runId: runId,
     });
 
     const startTime = Date.now();
-    const result: any = await agent.generate(prompt, { 
+    const result = await agent.generate(prompt, { 
         maxSteps, 
         maxRetries: 3,
-
     });
     const duration = Date.now() - startTime;
     
-    const text = (result?.text || "{}").toString();
+    // Extract text from agent result - it may be in different forms depending on Mastra version
+    const resultObj = result as { text?: string };
+    const text = (resultObj?.text || "{}").toString();
     
-    logger?.debug("📤 Agent response received", {
+    logger?.debug?.("📤 Agent response received", {
         responseLength: text.length,
         duration: `${duration}ms`,
         type: "AGENT_RESPONSE",
         runId: runId,
     });
     
-    // Try to extract JSON from response if it's wrapped in markdown or explanatory text
-    let jsonText = text;
-    const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/```\s*([\s\S]*?)\s*```/);
-    if (jsonMatch) {
-        jsonText = jsonMatch[1];
-        logger?.debug("📋 Extracted JSON from markdown", {
-            originalLength: text.length,
-            extractedLength: jsonText.length,
-            type: "JSON_EXTRACTION",
-            runId: runId,
-        });
-    } else {
-        // Look for JSON object boundaries
-        const start = text.indexOf('{');
-        const end = text.lastIndexOf('}');
-        if (start !== -1 && end !== -1 && end > start) {
-            jsonText = text.substring(start, end + 1);
-            logger?.debug("📋 Extracted JSON from boundaries", {
-                originalLength: text.length,
-                extractedLength: jsonText.length,
-                boundaries: { start, end },
-                type: "JSON_EXTRACTION",
-                runId: runId,
-            });
-        }
-    }
+    // Extract JSON from response
+    let jsonText = extractJsonFromText(text);
+    
+    logger?.debug?.("📋 JSON extraction complete", {
+        originalLength: text.length,
+        extractedLength: jsonText.length,
+        type: "JSON_EXTRACTION",
+        runId: runId,
+    });
     
     try {
         const parsed = JSON.parse(jsonText);
         const normalized = normalizeAgentJsonForSchemas(parsed);
         const validated = schema.parse(normalized);
         
-        logger?.debug("✅ JSON parsing and validation successful", {
+        logger?.debug?.("✅ JSON parsing and validation successful", {
             jsonLength: jsonText.length,
             validatedKeys: typeof validated === 'object' && validated !== null ? Object.keys(validated as object).length : 0,
             type: "JSON_VALIDATION",
@@ -293,26 +276,39 @@ async function callContextAgentForAnalysis<T>(
         
         return validated;
     } catch (error) {
-        logger?.error("❌ JSON parsing or validation failed", {
-            error: error instanceof Error ? error.message : 'Unknown error',
-            jsonText: jsonText.substring(0, 500), // First 500 chars for debugging
+        // Try recovery
+        logger?.warn?.("⚠️ JSON parsing failed, attempting recovery", {
+            error: getErrorMessage(error),
             type: "JSON_ERROR",
             runId: runId,
         });
         
-        throw new Error(`JSON parsing failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        try {
+            const recoveredJson = attemptJsonRecovery(jsonText);
+            const parsed = JSON.parse(recoveredJson);
+            const normalized = normalizeAgentJsonForSchemas(parsed);
+            return schema.parse(normalized);
+        } catch (recoveryError) {
+            logger?.error?.("❌ JSON parsing and recovery both failed", {
+                error: getErrorMessage(error),
+                jsonText: jsonText.substring(0, 500),
+                type: "JSON_ERROR",
+                runId: runId,
+            });
+            
+            throw new Error(`JSON parsing failed: ${getErrorMessage(error)}`);
+        }
     }
 }
 
-// Retry wrapper that sends 'in_progress' alerts on intermediate failures and only marks the step
-// as 'failed' if all attempts are exhausted. On success, the caller should still send 'completed'.
+// Retry wrapper with alerts
 async function withRetryAndAlerts<T>(options: {
     stepId: string;
     containerId: string;
     runId?: string;
     titleOnRetry?: string;
     maxAttempts?: number;
-    logger?: any;
+    logger?: Logger | null;
     attempt: () => Promise<T>;
 }): Promise<T> {
     const { stepId, containerId, runId, titleOnRetry, maxAttempts = 3, logger, attempt } = options;
@@ -321,7 +317,7 @@ async function withRetryAndAlerts<T>(options: {
         try {
             const result = await attempt();
             if (attemptIndex > 1) {
-                logger?.info("🔁 Step succeeded after retry", {
+                logger?.info?.("🔁 Step succeeded after retry", {
                     stepId,
                     attempt: attemptIndex,
                     type: "RETRY_SUCCESS",
@@ -331,10 +327,10 @@ async function withRetryAndAlerts<T>(options: {
             return result;
         } catch (error) {
             lastError = error;
-            logger?.warn("⚠️ Attempt failed", {
+            logger?.warn?.("⚠️ Attempt failed", {
                 stepId,
                 attempt: attemptIndex,
-                error: error instanceof Error ? error.message : 'Unknown error',
+                error: getErrorMessage(error),
                 type: "RETRY_WARN",
                 runId: runId,
             });
@@ -345,33 +341,32 @@ async function withRetryAndAlerts<T>(options: {
                     runId,
                     containerId,
                     title: titleOnRetry || "Retrying after error",
-                    subtitle: error instanceof Error ? error.message : 'Unknown error',
+                    subtitle: getErrorMessage(error),
                     level: 'warning',
                     toolCallCount: cliToolMetrics.callCount,
                     metadata: { attempt: attemptIndex, maxAttempts },
                 });
                 continue;
             }
-            throw error instanceof Error ? error : new Error('Unknown error');
+            throw error instanceof Error ? error : new Error(getErrorMessage(error));
         }
     }
     // Unreachable; satisfies TypeScript
-    throw lastError instanceof Error ? lastError : new Error('Unknown error');
+    throw lastError instanceof Error ? lastError : new Error(getErrorMessage(lastError));
 }
 
-// Step 1: Comprehensive Repository Analysis
+// =============================================================================
+// STEP 1: ANALYZE REPOSITORY
+// =============================================================================
+
 export const analyzeRepositoryStep = createStep({
     id: "analyze-repository-step",
-    inputSchema: WorkflowInput,
-    outputSchema: z.object({
-        containerId: z.string(),
-        repository: RepositoryStructure,
-        projectId: z.string(),
-    }),
+    inputSchema: WorkflowInputSchema,
+    outputSchema: AnalyzeRepositoryOutputSchema,
     execute: async ({ inputData, mastra, runId }) => {
         const { containerId } = inputData;
-        const repoPath = (inputData as any).repoPath || '';
-        const logger = ALERTS_ONLY ? null : mastra?.getLogger();
+        const repoPath = inputData.repoPath || '';
+        const logger = ALERTS_ONLY ? null : mastra?.getLogger() as Logger | undefined;
         await notifyStepStatus({
             stepId: "analyze-repository-step",
             status: "starting",
@@ -381,7 +376,7 @@ export const analyzeRepositoryStep = createStep({
             subtitle: "Quick repository scan starting",
         });
         
-        logger?.info("🔍 Starting quick repository scan", {
+        logger?.info?.("🔍 Starting quick repository scan", {
             step: "1/6", 
             stepName: "Repository Quick Scan",
             containerId,
@@ -402,7 +397,7 @@ MANDATORY WORKFLOW (Execute in exact order):
 6. Package type: docker_exec REPO_DIR=$( if [ -n '${repoPath}' ] && [ -d '${repoPath}/.git' ]; then echo '${repoPath}'; else for d in /app/*; do if [ -d "$d/.git" ]; then echo "$d"; break; fi; done; fi ); cd "\${REPO_DIR:-/app}"; if [ -f package.json ]; then echo "SINGLE_PACKAGE"; else echo "OTHER"; fi
 
 STRICT JSON ENUM RULES:
-- Field repository.type must be one of: "monorepo" | "single-package" | "multi-project". If unsure, choose the closest; never output any other value.
+- Field type must be one of: "monorepo" | "single-package" | "multi-project". If unsure, choose the closest; never output any other value.
 - Field structure.packages[].type must be one of: "app" | "library" | "tool" | "config" | "unknown". If unsure, use "unknown".
 - Do not use values like "other", "directory", "single" or uppercase variants. Use lowercase with hyphens exactly as shown.
 
@@ -426,7 +421,7 @@ FAST ANALYSIS - Return JSON immediately:
 }`;
         
         try {
-            logger?.info("🤖 Quick repository assessment call", {
+            logger?.info?.("🤖 Quick repository assessment call", {
                 step: "1/6",
                 action: "agent-call",
                 agentType: "contextAgent",
@@ -441,10 +436,10 @@ FAST ANALYSIS - Return JSON immediately:
                 logger,
                 maxAttempts: 3,
                 titleOnRetry: "Analyze repository retry",
-                attempt: () => callContextAgentForAnalysis(prompt, RepositoryStructure, 8, runId, logger),
+                attempt: () => callContextAgentForAnalysis(prompt, RepositoryStructureSchema, 8, runId, logger),
             });
             
-            logger?.info("✅ Repository scan completed quickly", {
+            logger?.info?.("✅ Repository scan completed quickly", {
                 step: "1/6",
                 stepName: "Repository Analysis",
                 duration: "completed",
@@ -473,10 +468,10 @@ FAST ANALYSIS - Return JSON immediately:
                 projectId: inputData.projectId,
             };
         } catch (error) {
-            logger?.error("❌ Repository analysis failed", {
+            logger?.error?.("❌ Repository analysis failed", {
                 step: "1/6",
                 stepName: "Repository Analysis",
-                error: error instanceof Error ? error.message : 'Unknown error',
+                error: getErrorMessage(error),
                 containerId,
                 type: "WORKFLOW",
                 runId: runId,
@@ -488,12 +483,12 @@ FAST ANALYSIS - Return JSON immediately:
                 runId,
                 containerId,
                 title: "Analyze repository failed",
-                subtitle: error instanceof Error ? error.message : 'Unknown error',
+                subtitle: getErrorMessage(error),
                 level: 'error',
                 toolCallCount: cliToolMetrics.callCount,
             });
 
-            logger?.warn("🔄 Using fallback repository structure", {
+            logger?.warn?.("🔄 Using fallback repository structure", {
                 step: "1/6",
                 action: "fallback",
                 type: "WORKFLOW",
@@ -526,19 +521,18 @@ FAST ANALYSIS - Return JSON immediately:
     },
 });
 
-// Step 2: Deep Codebase Analysis
+// =============================================================================
+// STEP 2: ANALYZE CODEBASE
+// =============================================================================
+
 export const analyzeCodebaseStep = createStep({
     id: "analyze-codebase-step",
-    inputSchema: WorkflowInput,
-    outputSchema: z.object({
-        containerId: z.string(),
-        codebase: CodebaseAnalysis,
-        projectId: z.string(),
-    }),
+    inputSchema: WorkflowInputSchema,
+    outputSchema: AnalyzeCodebaseOutputSchema,
     execute: async ({ inputData, mastra, runId }) => {
         const { containerId } = inputData;
-        const repoPath = (inputData as any).repoPath || '';
-        const logger = ALERTS_ONLY ? null : mastra?.getLogger();
+        const repoPath = inputData.repoPath || '';
+        const logger = ALERTS_ONLY ? null : mastra?.getLogger() as Logger | undefined;
         await notifyStepStatus({
             stepId: "analyze-codebase-step",
             status: "starting",
@@ -548,7 +542,7 @@ export const analyzeCodebaseStep = createStep({
             subtitle: "Focused codebase scan starting",
         });
         
-        logger?.info("📊 Starting focused codebase scan", {
+        logger?.info?.("📊 Starting focused codebase scan", {
             step: "2/6",
             stepName: "Codebase Analysis",
             containerId,
@@ -590,7 +584,7 @@ IMMEDIATE JSON RESPONSE:
 }`;
         
         try {
-            logger?.info("🔬 Quick dependency and framework scan", {
+            logger?.info?.("🔬 Quick dependency and framework scan", {
                 step: "2/6",
                 action: "agent-call",
                 agentType: "contextAgent",
@@ -606,10 +600,10 @@ IMMEDIATE JSON RESPONSE:
                 logger,
                 maxAttempts: 3,
                 titleOnRetry: "Analyze codebase retry",
-                attempt: () => callContextAgentForAnalysis(prompt, CodebaseAnalysis, 6, runId, logger),
+                attempt: () => callContextAgentForAnalysis(prompt, CodebaseAnalysisSchema, 6, runId, logger),
             });
             
-            logger?.info("✅ Codebase scan completed efficiently", {
+            logger?.info?.("✅ Codebase scan completed efficiently", {
                 step: "2/6",
                 stepName: "Codebase Analysis",
                 duration: "completed",
@@ -638,10 +632,10 @@ IMMEDIATE JSON RESPONSE:
                 projectId: inputData.projectId,
             };
         } catch (error) {
-            logger?.error("❌ Codebase analysis failed", {
+            logger?.error?.("❌ Codebase analysis failed", {
                 step: "2/6",
                 stepName: "Codebase Analysis",
-                error: error instanceof Error ? error.message : 'Unknown error',
+                error: getErrorMessage(error),
                 containerId,
                 type: "WORKFLOW",
                 runId: runId,
@@ -653,12 +647,12 @@ IMMEDIATE JSON RESPONSE:
                 runId,
                 containerId,
                 title: "Analyze codebase failed",
-                subtitle: error instanceof Error ? error.message : 'Unknown error',
+                subtitle: getErrorMessage(error),
                 level: 'error',
                 toolCallCount: cliToolMetrics.callCount,
             });
 
-            logger?.warn("🔄 Using fallback codebase structure", {
+            logger?.warn?.("🔄 Using fallback codebase structure", {
                 step: "2/6",
                 action: "fallback",
                 type: "WORKFLOW",
@@ -697,19 +691,18 @@ IMMEDIATE JSON RESPONSE:
     },
 });
 
-// Step 3: Build and Deployment Analysis
+// =============================================================================
+// STEP 3: ANALYZE BUILD & DEPLOYMENT
+// =============================================================================
+
 export const analyzeBuildDeploymentStep = createStep({
     id: "analyze-build-deployment-step",
-    inputSchema: WorkflowInput,
-    outputSchema: z.object({
-        containerId: z.string(),
-        buildDeploy: BuildAndDeployment,
-        projectId: z.string(),
-    }),
+    inputSchema: WorkflowInputSchema,
+    outputSchema: AnalyzeBuildDeploymentOutputSchema,
     execute: async ({ inputData, mastra, runId }) => {
         const { containerId } = inputData;
-        const repoPath = (inputData as any).repoPath || '';
-        const logger = ALERTS_ONLY ? null : mastra?.getLogger();
+        const repoPath = inputData.repoPath || '';
+        const logger = ALERTS_ONLY ? null : mastra?.getLogger() as Logger | undefined;
         await notifyStepStatus({
             stepId: "analyze-build-deployment-step",
             status: "starting",
@@ -719,7 +712,7 @@ export const analyzeBuildDeploymentStep = createStep({
             subtitle: "DevOps scan starting",
         });
         
-        logger?.info("🏗️ Starting fast build system scan", {
+        logger?.info?.("🏗️ Starting fast build system scan", {
             step: "3/6",
             stepName: "Build & Deployment Analysis",
             containerId,
@@ -764,7 +757,7 @@ INSTANT JSON:
 }`;
         
         try {
-            logger?.info("🚀 Quick build and deployment check", {
+            logger?.info?.("🚀 Quick build and deployment check", {
                 step: "3/6",
                 action: "agent-call",
                 agentType: "contextAgent",
@@ -780,10 +773,10 @@ INSTANT JSON:
                 logger,
                 maxAttempts: 3,
                 titleOnRetry: "Analyze build & deployment retry",
-                attempt: () => callContextAgentForAnalysis(prompt, BuildAndDeployment, 4, runId, logger),
+                attempt: () => callContextAgentForAnalysis(prompt, BuildAndDeploymentSchema, 4, runId, logger),
             });
             
-            logger?.info("✅ Build system scan completed rapidly", {
+            logger?.info?.("✅ Build system scan completed rapidly", {
                 step: "3/6",
                 stepName: "Build & Deployment Analysis",
                 duration: "completed",
@@ -813,10 +806,10 @@ INSTANT JSON:
                 projectId: inputData.projectId,
             };
         } catch (error) {
-            logger?.error("❌ Build and deployment analysis failed", {
+            logger?.error?.("❌ Build and deployment analysis failed", {
                 step: "3/6",
                 stepName: "Build & Deployment Analysis",
-                error: error instanceof Error ? error.message : 'Unknown error',
+                error: getErrorMessage(error),
                 containerId,
                 type: "WORKFLOW",
                 runId: runId,
@@ -828,12 +821,12 @@ INSTANT JSON:
                 runId,
                 containerId,
                 title: "Analyze build & deployment failed",
-                subtitle: error instanceof Error ? error.message : 'Unknown error',
+                subtitle: getErrorMessage(error),
                 level: 'error',
                 toolCallCount: cliToolMetrics.callCount,
             });
 
-            logger?.warn("🔄 Using fallback build deployment structure", {
+            logger?.warn?.("🔄 Using fallback build deployment structure", {
                 step: "3/6",
                 action: "fallback",
                 type: "WORKFLOW",
@@ -876,37 +869,21 @@ INSTANT JSON:
     },
 });
 
-// Step 4: Synthesize Final Context  
+// =============================================================================
+// STEP 4: SYNTHESIZE CONTEXT
+// =============================================================================
+
 export const synthesizeContextStep = createStep({
     id: "synthesize-context-step",
-    inputSchema: z.object({
-        "analyze-repository-step": z.object({
-            containerId: z.string(),
-            repository: RepositoryStructure,
-            projectId: z.string(),
-        }),
-        "analyze-codebase-step": z.object({
-            containerId: z.string(),
-            codebase: CodebaseAnalysis,
-            projectId: z.string(),
-        }),
-        "analyze-build-deployment-step": z.object({
-            containerId: z.string(),
-            buildDeploy: BuildAndDeployment,
-            projectId: z.string(),
-        }),
-    }),
-    outputSchema: RepoContext.extend({
-        containerId: z.string(),
-        projectId: z.string(),
-    }),
+    inputSchema: ParallelAnalysisInputSchema,
+    outputSchema: SynthesizeContextOutputSchema,
     execute: async ({ inputData, mastra, runId }) => {
         // Extract results from parallel execution
         const repository = inputData["analyze-repository-step"].repository;
         const codebase = inputData["analyze-codebase-step"].codebase;
         const buildDeploy = inputData["analyze-build-deployment-step"].buildDeploy;
         const containerId = inputData["analyze-repository-step"].containerId;
-        const logger = ALERTS_ONLY ? null : mastra?.getLogger();
+        const logger = ALERTS_ONLY ? null : mastra?.getLogger() as Logger | undefined;
         await notifyStepStatus({
             stepId: "synthesize-context-step",
             status: "starting",
@@ -916,7 +893,7 @@ export const synthesizeContextStep = createStep({
             subtitle: "Generating insights and executive summary",
         });
         
-        logger?.info("🧠 Starting context synthesis and insights generation", {
+        logger?.info?.("🧠 Starting context synthesis and insights generation", {
             step: "4/6",
             stepName: "Context Synthesis",
             repositoryType: repository.type,
@@ -982,7 +959,7 @@ Return strictly JSON matching this schema:
 }`;
         
         try {
-            logger?.info("💡 Generating insights and executive summary", {
+            logger?.info?.("💡 Generating insights and executive summary", {
                 step: "4/6",
                 action: "agent-call",
                 agentType: "contextAgent",
@@ -991,9 +968,9 @@ Return strictly JSON matching this schema:
                 runId: runId,
             });
 
-            const result = await callContextAgentForAnalysis(prompt, RepoContext, 10, runId, logger);
+            const result = await callContextAgentForAnalysis(prompt, RepoContextSchema, 10, runId, logger);
             
-            logger?.info("✅ Context synthesis completed successfully", {
+            logger?.info?.("✅ Context synthesis completed successfully", {
                 step: "4/6",
                 stepName: "Context Synthesis",
                 duration: "completed",
@@ -1023,10 +1000,10 @@ Return strictly JSON matching this schema:
 
             return { ...result, containerId, projectId: inputData["analyze-repository-step"].projectId };
         } catch (error) {
-            logger?.error("❌ Context synthesis failed", {
+            logger?.error?.("❌ Context synthesis failed", {
                 step: "4/6",
                 stepName: "Context Synthesis",
-                error: error instanceof Error ? error.message : 'Unknown error',
+                error: getErrorMessage(error),
                 type: "WORKFLOW",
                 runId: runId,
             });
@@ -1037,12 +1014,12 @@ Return strictly JSON matching this schema:
                 runId,
                 containerId,
                 title: "Synthesize context failed",
-                subtitle: error instanceof Error ? error.message : 'Unknown error',
+                subtitle: getErrorMessage(error),
                 level: 'error',
                 toolCallCount: cliToolMetrics.callCount,
             });
 
-            logger?.warn("🔄 Using fallback insights and summary", {
+            logger?.warn?.("🔄 Using fallback insights and summary", {
                 step: "4/6",
                 action: "fallback",
                 type: "WORKFLOW",
@@ -1078,21 +1055,16 @@ Return strictly JSON matching this schema:
     },
 });
 
-// Step 5: Save Context for Unit Testing
+// =============================================================================
+// STEP 5: SAVE CONTEXT
+// =============================================================================
+
 export const gatherSaveContextStep = createStep({
     id: "gather-save-context-step",
-    inputSchema: RepoContext.extend({
-        containerId: z.string(),
-        projectId: z.string(),
-    }),
-    outputSchema: z.object({
-        containerId: z.string(),
-        contextPath: z.string(),
-        repoContext: RepoContext,
-        projectId: z.string(),
-    }),
+    inputSchema: SynthesizeContextOutputSchema,
+    outputSchema: SaveContextOutputSchema,
     execute: async ({ inputData, mastra, runId }) => {
-        const logger = ALERTS_ONLY ? null : mastra?.getLogger();
+        const logger = ALERTS_ONLY ? null : mastra?.getLogger() as Logger | undefined;
         await notifyStepStatus({
             stepId: "save-context-step",
             status: "starting",
@@ -1102,7 +1074,7 @@ export const gatherSaveContextStep = createStep({
             subtitle: "Writing agent.context.json",
         });
         
-        logger?.info("💾 Saving context for unit test generation", {
+        logger?.info?.("💾 Saving context for unit test generation", {
             step: "5/6",
             stepName: "Save Unit Test Context",
             startTime: new Date().toISOString(),
@@ -1110,8 +1082,8 @@ export const gatherSaveContextStep = createStep({
             runId: runId,
         });
 
-        const { containerId, ...repoContextData } = inputData;
-        const parsed = RepoContext.parse(repoContextData);
+        const { containerId, projectId, ...repoContextData } = inputData;
+        const parsed = RepoContextSchema.parse(repoContextData);
 
         // Enhanced context specifically for unit testing
         const unitTestContext = {
@@ -1176,7 +1148,7 @@ export const gatherSaveContextStep = createStep({
 
         try {
             // Write context JSON to a temp file and copy into the Docker container for reliability
-            return await new Promise((resolve, reject) => {
+            return await new Promise<z.infer<typeof SaveContextOutputSchema>>((resolve, reject) => {
                 let tempFilePath: string | null = null;
 
                 try {
@@ -1184,7 +1156,7 @@ export const gatherSaveContextStep = createStep({
                     tempFilePath = path.join(tempDir, 'agent.context.json');
                     writeFileSync(tempFilePath, contextJson, 'utf8');
 
-                    logger?.info("🐳 Copying context file into Docker container", {
+                    logger?.info?.("🐳 Copying context file into Docker container", {
                         step: "5/6",
                         action: "docker-cp",
                         path: contextPath,
@@ -1201,7 +1173,7 @@ export const gatherSaveContextStep = createStep({
                         }
 
                         if (copyError) {
-                            logger?.error("❌ Failed to copy context file to container", {
+                            logger?.error?.("❌ Failed to copy context file to container", {
                                 error: copyStderr || copyError.message,
                                 type: "WORKFLOW",
                                 runId: runId,
@@ -1213,7 +1185,7 @@ export const gatherSaveContextStep = createStep({
                         const verifyCmd = `docker exec ${containerId} bash -lc "test -f ${contextPath} && wc -c ${contextPath}"`;
                         exec(verifyCmd, (verifyError, verifyStdout, verifyStderr) => {
                             if (verifyError) {
-                                logger?.error("❌ Context file verification failed", {
+                                logger?.error?.("❌ Context file verification failed", {
                                     error: verifyStderr || verifyError.message,
                                     type: "WORKFLOW",
                                     runId: runId,
@@ -1223,7 +1195,7 @@ export const gatherSaveContextStep = createStep({
                             }
 
                             const fileSize = verifyStdout.trim().split(' ')[0] || '0';
-                            logger?.info("✅ Context file saved to container", {
+                            logger?.info?.("✅ Context file saved to container", {
                                 step: "5/6",
                                 contextPath,
                                 fileSize: `${parseInt(fileSize)} bytes`,
@@ -1253,7 +1225,7 @@ export const gatherSaveContextStep = createStep({
                                 containerId,
                                 contextPath,
                                 repoContext: parsed,
-                                projectId: inputData.projectId,
+                                projectId,
                             });
                         });
                     });
@@ -1266,16 +1238,16 @@ export const gatherSaveContextStep = createStep({
                 }
             });
         } catch (error) {
-            logger?.error("❌ Failed to save context file", {
+            logger?.error?.("❌ Failed to save context file", {
                 step: "5/6",
                 stepName: "Save Unit Test Context",
-                error: error instanceof Error ? error.message : 'Unknown error',
+                error: getErrorMessage(error),
                 contextPath,
                 type: "WORKFLOW",
                 runId: runId,
             });
 
-            logger?.warn("🔄 Continuing without saved context file", {
+            logger?.warn?.("🔄 Continuing without saved context file", {
                 step: "5/6",
                 action: "continue-without-file",
                 type: "WORKFLOW",
@@ -1289,7 +1261,7 @@ export const gatherSaveContextStep = createStep({
                 containerId: inputData.containerId,
                 contextPath,
                 title: "Save unit test context failed",
-                subtitle: error instanceof Error ? error.message : 'Unknown error',
+                subtitle: getErrorMessage(error),
                 level: 'error',
                 toolCallCount: cliToolMetrics.callCount,
             });
@@ -1298,32 +1270,22 @@ export const gatherSaveContextStep = createStep({
                 containerId,
                 contextPath: "not-saved",
                 repoContext: parsed,
-                projectId: inputData.projectId,
+                projectId,
             };
         }
     },
 });
 
+// =============================================================================
+// STEP 6: VALIDATE AND RETURN
+// =============================================================================
 
-// Final validation and return step
 export const validateAndReturnStep = createStep({
     id: "validate-and-return-step",
-    inputSchema: z.object({
-        containerId: z.string(),
-        contextPath: z.string(),
-        repoContext: RepoContext,
-        projectId: z.string(),
-    }),
-    outputSchema: z.object({
-        result: z.string(),
-        success: z.boolean(),
-        toolCallCount: z.number(),
-        contextPath: z.string(),
-        repoContext: RepoContext,
-        projectId: z.string(),
-    }),
+    inputSchema: SaveContextOutputSchema,
+    outputSchema: ValidateOutputSchema,
     execute: async ({ inputData, mastra, runId }) => {
-        const logger = ALERTS_ONLY ? null : mastra?.getLogger();
+        const logger = ALERTS_ONLY ? null : mastra?.getLogger() as Logger | undefined;
         await notifyStepStatus({
             stepId: "validate-and-return-step",
             status: "starting",
@@ -1333,7 +1295,7 @@ export const validateAndReturnStep = createStep({
             subtitle: "Final validation starting",
         });
         
-        logger?.info("🔍 Starting final validation and summary", {
+        logger?.info?.("🔍 Starting final validation and summary", {
             step: "6/6",
             stepName: "Validation & Summary",
             startTime: new Date().toISOString(),
@@ -1343,9 +1305,9 @@ export const validateAndReturnStep = createStep({
 
         try {
             const { containerId, contextPath, repoContext } = inputData;
-            const parsed = RepoContext.parse(repoContext);
+            const parsed = RepoContextSchema.parse(repoContext);
             
-            logger?.info("📋 Workflow execution summary", {
+            logger?.info?.("📋 Workflow execution summary", {
                 step: "6/6",
                 stepName: "Validation & Summary",
                 totalToolCalls: cliToolMetrics.callCount,
@@ -1371,7 +1333,7 @@ export const validateAndReturnStep = createStep({
                 runId: runId,
             });
 
-            logger?.info("✅ Repository context analysis completed successfully", {
+            logger?.info?.("✅ Repository context analysis completed successfully", {
                 step: "6/6",
                 stepName: "Validation & Summary",
                 duration: "completed",
@@ -1401,10 +1363,10 @@ export const validateAndReturnStep = createStep({
                 projectId: inputData.projectId,
             };
         } catch (error) {
-            logger?.error("❌ Final validation failed", {
+            logger?.error?.("❌ Final validation failed", {
                 step: "6/6",
                 stepName: "Validation & Summary",
-                error: error instanceof Error ? error.message : 'Unknown error',
+                error: getErrorMessage(error),
                 type: "WORKFLOW",
                 runId: runId,
             });
@@ -1415,23 +1377,26 @@ export const validateAndReturnStep = createStep({
                 runId,
                 containerId: inputData.containerId,
                 title: "Validation failed",
-                subtitle: error instanceof Error ? error.message : 'Unknown error',
+                subtitle: getErrorMessage(error),
                 level: 'error',
                 toolCallCount: cliToolMetrics.callCount,
             });
 
-            throw new Error(`Validation failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            throw new Error(`Validation failed: ${getErrorMessage(error)}`);
         }
     }
 });
 
-// Workflow start logging step
+// =============================================================================
+// WORKFLOW START STEP
+// =============================================================================
+
 export const workflowStartStep = createStep({
     id: "workflow-start-step", 
-    inputSchema: WorkflowInput,
-    outputSchema: WorkflowInput,
+    inputSchema: WorkflowInputSchema,
+    outputSchema: WorkflowInputSchema,
     execute: async ({ inputData, mastra, runId }) => {
-        const logger = ALERTS_ONLY ? null : mastra?.getLogger();
+        const logger = ALERTS_ONLY ? null : mastra?.getLogger() as Logger | undefined;
         await notifyStepStatus({
             stepId: "workflow-start-step",
             status: "starting",
@@ -1441,7 +1406,7 @@ export const workflowStartStep = createStep({
             subtitle: "Planning and setup",
         });
         
-        logger?.info("🚀 Starting fast repository context workflow", {
+        logger?.info?.("🚀 Starting fast repository context workflow", {
             workflowId: "gather-context-workflow",
             workflowName: "Fast Repository Context Analysis",
             containerId: inputData.containerId,
@@ -1452,7 +1417,7 @@ export const workflowStartStep = createStep({
             runId: runId,
         });
 
-        logger?.info("📋 Fast workflow execution plan", {
+        logger?.info?.("📋 Fast workflow execution plan", {
             steps: [
                 "1/6: Workflow Start - Log execution plan & setup",
                 "2/6: Parallel Analysis - Repository, Codebase & Build scans (concurrent)",
@@ -1481,18 +1446,15 @@ export const workflowStartStep = createStep({
     },
 });
 
+// =============================================================================
+// WORKFLOW DEFINITION
+// =============================================================================
+
 export const gatherContextWorkflow = createWorkflow({
     id: "gather-context-workflow",
     description: "Ultra-fast parallel repository analysis optimized for unit test generation with context saved to agent.context.json",
-    inputSchema: WorkflowInput,
-    outputSchema: z.object({
-        result: z.string(),
-        success: z.boolean(),
-        toolCallCount: z.number(),
-        contextPath: z.string(),
-        repoContext: RepoContext,
-        projectId: z.string(),
-    }),
+    inputSchema: WorkflowInputSchema,
+    outputSchema: ValidateOutputSchema,
 })
 .then(workflowStartStep)
 .parallel([analyzeRepositoryStep, analyzeCodebaseStep, analyzeBuildDeploymentStep])
@@ -1500,4 +1462,3 @@ export const gatherContextWorkflow = createWorkflow({
 .then(gatherSaveContextStep)
 .then(validateAndReturnStep)
 .commit();
-

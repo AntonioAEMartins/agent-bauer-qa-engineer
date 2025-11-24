@@ -3,59 +3,81 @@ import z from "zod";
 import { notifyStepStatus } from "../../tools/alert-notifier";
 import { cliToolMetrics } from "../../tools/cli-tool";
 import { mastra } from "../..";
+import { 
+    getErrorMessage,
+    extractJsonFromText,
+    CoverageStatsSchema,
+} from "../../types";
 
 const ALERTS_ONLY = (process.env.ALERTS_ONLY === 'true') || (process.env.LOG_MODE === 'alerts_only') || (process.env.MASTRA_LOG_MODE === 'alerts_only');
 
+// Logger interface for type safety
+interface Logger {
+    info?: (message: string, meta?: Record<string, unknown>) => void;
+    debug?: (message: string, meta?: Record<string, unknown>) => void;
+    warn?: (message: string, meta?: Record<string, unknown>) => void;
+    error?: (message: string, meta?: Record<string, unknown>) => void;
+}
+
+// =============================================================================
+// SCHEMAS
+// =============================================================================
+
+const CoverageInputSchema = z.object({
+    containerId: z.string(),
+    projectId: z.string(),
+    repoPath: z.string().optional(),
+    prUrl: z.string().optional(),
+    contextPath: z.string().optional(),
+    result: z.string().optional(),
+    success: z.boolean().optional(),
+    toolCallCount: z.number().optional(),
+});
+
+const CoverageOutputSchema = z.object({
+    containerId: z.string(),
+    projectId: z.string(),
+    coverage: z.number(), // 0..1
+    repoPath: z.string(),
+    language: z.string(),
+    framework: z.string(),
+    method: z.string(), // 'json' | 'xml' | 'stdout' | 'algorithmic'
+    stats: CoverageStatsSchema,
+    files: z.number(),
+    prUrl: z.string().optional(),
+    contextPath: z.string().optional(),
+    result: z.string().optional(),
+    success: z.boolean(),
+    toolCallCount: z.number().optional(),
+});
+
+type CoverageInput = z.infer<typeof CoverageInputSchema>;
+type CoverageOutput = z.infer<typeof CoverageOutputSchema>;
+
+// Agent coverage response schema
+const CoverageAgentResponseSchema = z.object({
+    isValid: z.boolean(),
+    repoPath: z.string(),
+    language: z.string().default("TypeScript"),
+    framework: z.string().default("Vitest"),
+    coverage: z.number(),
+    method: z.string(),
+    stats: CoverageStatsSchema.optional(),
+    files: z.number(),
+    reason: z.string().optional(),
+});
+
+type CoverageAgentResponse = z.infer<typeof CoverageAgentResponseSchema>;
+
+// =============================================================================
+// STEP 1: Run TypeScript + Vitest Coverage
+// =============================================================================
+
 export const runTypescriptVitestCoverageStep = createStep({
     id: "run-typescript-vitest-coverage-step",
-    inputSchema: z.object({
-        containerId: z.string(),
-        projectId: z.string(),
-        repoPath: z.string().optional(),
-        prUrl: z.string().optional(),
-        contextPath: z.string().optional(),
-        result: z.string().optional(),
-        success: z.boolean().optional(),
-        toolCallCount: z.number().optional(),
-    }),
-    outputSchema: z.object({
-        containerId: z.string(),
-        projectId: z.string(),
-        coverage: z.number(), // 0..1
-        repoPath: z.string(),
-        language: z.string(),
-        framework: z.string(),
-        method: z.string(), // 'json' | 'xml' | 'stdout' | 'algorithmic'
-        stats: z.object({
-            statements: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            branches: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            functions: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            lines: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-        }),
-        files: z.number(),
-        prUrl: z.string().optional(),
-        contextPath: z.string().optional(),
-        result: z.string().optional(),
-        success: z.boolean(),
-        toolCallCount: z.number().optional(),
-    }),
-    execute: async ({ inputData, runId }) => {
+    inputSchema: CoverageInputSchema,
+    outputSchema: CoverageOutputSchema,
+    execute: async ({ inputData, runId }): Promise<CoverageOutput> => {
         await notifyStepStatus({
             stepId: "run-typescript-vitest-coverage-step",
             status: "starting",
@@ -65,7 +87,7 @@ export const runTypescriptVitestCoverageStep = createStep({
             subtitle: "Using intelligent agent to validate and calculate coverage",
         });
 
-        const logger = ALERTS_ONLY ? null : mastra.getLogger();
+        const logger = ALERTS_ONLY ? null : mastra.getLogger() as Logger | undefined;
         const agent = mastra.getAgent("typescriptVitestCoverageAgent");
         if (!agent) throw new Error("typescriptVitestCoverageAgent not registered");
 
@@ -125,38 +147,23 @@ BE SPECIFIC: Include exact commands you tried and their outputs in the reason fi
 
 CRITICAL: This solution must work for ANY TypeScript + Vitest repository in any container setup - never hardcode paths or repository names!`;
 
-        const result: any = await agent.generate(prompt, { maxSteps: 100, maxRetries: 2 });
-        const text = String(result?.text || "{}");
+        const result = await agent.generate(prompt, { maxSteps: 100, maxRetries: 2 });
+        const resultObj = result as { text?: string };
+        const text = String(resultObj?.text || "{}");
         
-        // Extract JSON from response - improved parsing
-        let jsonText = "";
+        // Extract JSON from response
+        const jsonText = extractJsonFromText(text);
         
-        // Try to extract from markdown code blocks first
-        const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-        if (jsonMatch && jsonMatch[1]) {
-            jsonText = jsonMatch[1].trim();
-        } else {
-            // Look for JSON object in the text
-            const startIndex = text.indexOf('{');
-            const lastIndex = text.lastIndexOf('}');
-            if (startIndex !== -1 && lastIndex !== -1 && lastIndex > startIndex) {
-                jsonText = text.substring(startIndex, lastIndex + 1);
-            } else {
-                // Fallback: try to find JSON-like pattern
-                const jsonPattern = /\{[\s\S]*"isValid"[\s\S]*\}/;
-                const match = text.match(jsonPattern);
-                jsonText = match ? match[0] : "{}";
-            }
-        }
-        
-        let parsed;
+        let parsed: CoverageAgentResponse;
         try {
-            parsed = JSON.parse(jsonText);
+            const rawParsed = JSON.parse(jsonText);
+            // Validate with Zod schema
+            parsed = CoverageAgentResponseSchema.parse(rawParsed);
         } catch (error) {
             logger?.error?.("Failed to parse agent response", { 
                 originalText: text, 
                 extractedJson: jsonText, 
-                error: error 
+                error: getErrorMessage(error),
             });
             
             // If JSON parsing fails, try to create a fallback response
@@ -224,82 +231,15 @@ CRITICAL: This solution must work for ANY TypeScript + Vitest repository in any 
     },
 });
 
+// =============================================================================
+// STEP 2: Post Test Coverage to Backend
+// =============================================================================
+
 export const postTestCoverageStep = createStep({
     id: "post-test-coverage-step",
-    inputSchema: z.object({
-        containerId: z.string(),
-        projectId: z.string(),
-        coverage: z.number(),
-        repoPath: z.string(),
-        language: z.string(),
-        framework: z.string(),
-        method: z.string(),
-        stats: z.object({
-            statements: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            branches: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            functions: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            lines: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-        }),
-        files: z.number(),
-        prUrl: z.string().optional(),
-        contextPath: z.string().optional(),
-        result: z.string().optional(),
-        success: z.boolean(),
-        toolCallCount: z.number().optional(),
-    }),
-    outputSchema: z.object({
-        containerId: z.string(),
-        projectId: z.string(),
-        coverage: z.number(),
-        language: z.string(),
-        framework: z.string(),
-        method: z.string(),
-        stats: z.object({
-            statements: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            branches: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            functions: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            lines: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-        }),
-        files: z.number(),
-        prUrl: z.string().optional(),
-        contextPath: z.string().optional(),
-        result: z.string().optional(),
-        success: z.boolean(),
-        toolCallCount: z.number().optional(),
-    }),
-    execute: async ({ inputData, runId }) => {
+    inputSchema: CoverageOutputSchema,
+    outputSchema: CoverageOutputSchema,
+    execute: async ({ inputData, runId }): Promise<CoverageOutput> => {
         const baseUrl = process.env.BASE_URL || 'http://localhost:3000';
         const url = `${baseUrl}/api/projects/${inputData.projectId}/test-coverage`;
 
@@ -327,7 +267,9 @@ export const postTestCoverageStep = createStep({
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
-        } catch {}
+        } catch {
+            // Best effort - continue even if POST fails
+        }
 
         await notifyStepStatus({
             stepId: "post-test-coverage-step",
@@ -342,6 +284,10 @@ export const postTestCoverageStep = createStep({
         return inputData;
     },
 });
+
+// =============================================================================
+// WORKFLOW DEFINITION
+// =============================================================================
 
 export const typescriptVitestCoverageWorkflow = createWorkflow({
     id: "typescript-vitest-coverage-workflow",
@@ -358,34 +304,12 @@ export const typescriptVitestCoverageWorkflow = createWorkflow({
         framework: z.string(),
         method: z.string(),
         files: z.number(),
-        stats: z.object({
-            statements: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            branches: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            functions: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-            lines: z.object({
-                total: z.number(),
-                covered: z.number(),
-                pct: z.number(),
-            }),
-        }),
+        stats: CoverageStatsSchema,
     }),
 })
-.then(runTypescriptVitestCoverageStep as any)
-.then(postTestCoverageStep as any)
+.then(runTypescriptVitestCoverageStep)
+.then(postTestCoverageStep)
 .commit();
 
 // Keep the old workflow for backward compatibility
 export const testCoverageWorkflow = typescriptVitestCoverageWorkflow;
-

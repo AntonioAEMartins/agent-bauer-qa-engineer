@@ -28,11 +28,11 @@ OUTPUT STYLE:
 RETURN FORMAT:
 When asked, return STRICT JSON with keys: {"description": string, "sources": string[], "confidence": number, "notes": string}. No extra text.
 `,
-    // model: openai("gpt-5-nano", {
-    //     parallelToolCalls: true,
-    //     reasoningEffort: "medium",
-    // }),
-    model: groq('openai/gpt-oss-120b'),
+    model: openai("gpt-5.1", {
+        parallelToolCalls: true,
+        reasoningEffort: "medium",
+    }),
+    // model: groq('openai/gpt-oss-120b'),
     tools: {
         docker_exec: dockerExecTool,
         exec_command: cliTool,

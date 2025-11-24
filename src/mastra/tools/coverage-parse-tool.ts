@@ -44,7 +44,7 @@ export const coverageParseTool = createTool({
         stdout: z.string().optional().describe("Raw stdout/stderr to parse when files are missing"),
     }),
     execute: async ({ context }) => {
-        const { containerId, repoPath, stdout } = context as any;
+        const { containerId, repoPath, stdout } = context as { containerId: string; repoPath: string; stdout?: string };
         if (!containerId || !repoPath) throw new Error("containerId and repoPath are required");
         cliToolMetrics.callCount += 1;
 

@@ -50,11 +50,11 @@ OUTPUT REQUIREMENTS:
 - Prioritized list of fixes or enhancements
 
 Be thorough in validation but practical in recommendations - focus on meaningful improvements.`,
-    // model: openai("gpt-5-mini", {
-    //     parallelToolCalls: true,
-    //     reasoningEffort: "high",
-    // }),
-    model: groq('openai/gpt-oss-120b'),
+    model: openai("gpt-5.1", {
+        parallelToolCalls: true,
+        reasoningEffort: "high",
+    }),
+    // model: groq('openai/gpt-oss-120b'),
 
     tools: {
         exec_command: cliTool,

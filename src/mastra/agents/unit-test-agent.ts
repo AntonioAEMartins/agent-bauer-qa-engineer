@@ -32,11 +32,11 @@ REQUIREMENTS:
 - Return JSON responses when requested
 
 Keep it simple and functional. Focus on creating working test files quickly.`,
-    // model: openai("gpt-5-mini", {
-    //     parallelToolCalls: true,
-    //     reasoningEffort: "low", // Changed from "high" to "low" for MVP validation
-    // }),
-    model: groq('openai/gpt-oss-120b'),
+    model: openai("gpt-5.1", {
+        parallelToolCalls: true,
+        reasoningEffort: "low", // Changed from "high" to "low" for MVP validation
+    }),
+    // model: groq('openai/gpt-oss-120b'),
 
     tools: {
         exec_command: cliTool,

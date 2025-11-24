@@ -32,11 +32,11 @@ BEST PRACTICES:
 - Keep messages short but specific; include scope if appropriate.
 - Validate remote origin and parse owner/repo for upstream details.
 - Verify commands succeeded (e.g., list files, show status).`,
-    // model: openai("gpt-5-nano", {
-    //     parallelToolCalls: true,
-    //     reasoningEffort: "medium",
-    // }),
-    model: groq('openai/gpt-oss-120b'),
+    model: openai("gpt-5.1", {
+        parallelToolCalls: true,
+        reasoningEffort: "medium",
+    }),
+    // model: groq('openai/gpt-oss-120b'),
 
     tools: {
         docker_exec: dockerExecTool,

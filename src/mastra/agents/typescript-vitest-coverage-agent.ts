@@ -138,11 +138,11 @@ UNIVERSAL PATH DISCOVERY STRATEGY:
 
 BE METHODICAL AND THOROUGH. Return ONLY JSON - no markdown formatting or explanations.
 `,
-    // model: openai("gpt-5", {
-    //     parallelToolCalls: true,
-    //     reasoningEffort: "medium",
-    // }),
-    model: groq('openai/gpt-oss-120b'),
+    model: openai("gpt-5.1", {
+        parallelToolCalls: true,
+        reasoningEffort: "medium",
+    }),
+    // model: groq('openai/gpt-oss-120b'),
 
     tools: {
         docker_exec: dockerExecTool,

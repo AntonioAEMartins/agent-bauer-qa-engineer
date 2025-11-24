@@ -47,11 +47,11 @@ OUTPUT REQUIREMENTS:
 - Include test count and coverage information
 
 Focus on generating production-ready test code that actually validates business logic.`,
-    // model: openai("gpt-5-mini", {
-    //     parallelToolCalls: true,
-    //     reasoningEffort: "high",
-    // }),
-    model: groq('openai/gpt-oss-120b'),
+    model: openai("gpt-5.1", {
+        parallelToolCalls: true,
+        reasoningEffort: "high",
+    }),
+    // model: groq('openai/gpt-oss-120b'),
 
     tools: {
         exec_command: cliTool,

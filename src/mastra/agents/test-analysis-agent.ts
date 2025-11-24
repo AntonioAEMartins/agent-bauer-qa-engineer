@@ -32,11 +32,11 @@ OUTPUT REQUIREMENTS:
 - Flag potential testing challenges and edge cases
 
 Be precise, thorough, and focus only on analysis - no test generation.`,
-    // model: openai("gpt-5-mini", {
-    //     parallelToolCalls: true,
-    //     reasoningEffort: "high",
-    // }),
-    model: groq('openai/gpt-oss-120b'),
+    model: openai("gpt-5.1", {
+        parallelToolCalls: true,
+        reasoningEffort: "high",
+    }),
+    // model: groq('openai/gpt-oss-120b'),
 
     tools: {
         exec_command: cliTool,
