@@ -57,8 +57,7 @@ export type AgentName =
     | "contextAgent"
     | "githubPrAgent"
     | "codebaseDescriptionAgent"
-    | "testCoveringAgent"
-    | "typescriptVitestCoverageAgent";
+    | "testCoverageAgent";
 
 // =============================================================================
 // JSON PARSING HELPERS

@@ -80,7 +80,7 @@ function getGithubTokenFromHost(): string | null {
 // SCHEMAS
 // =============================================================================
 
-// Input schema for prepareCommitAndPushStep
+// Input schema for prepareCommitStep
 const PrepareCommitInputSchema = z.object({
         containerId: z.string().describe("Docker container ID"),
         repoPath: z.string().optional().describe("Absolute path to the repository inside the container"),
@@ -97,7 +97,7 @@ const PrepareCommitInputSchema = z.object({
 
 type PrepareCommitInput = z.infer<typeof PrepareCommitInputSchema>;
 
-// Output schema for prepareCommitAndPushStep
+// Output schema for prepareCommitStep
 const PrepareCommitOutputSchema = z.object({
         containerId: z.string(),
         repoPath: z.string(),
@@ -171,8 +171,8 @@ const WorkflowOutputSchema = z.object({
 // Step 1: Prepare git branch, commit changes, and push
 // =============================================================================
 
-export const prepareCommitAndPushStep = createStep({
-    id: "prepare-commit-and-push-step",
+export const prepareCommitStep = createStep({
+    id: "prepareCommitStep",
     inputSchema: PrepareCommitInputSchema,
     outputSchema: PrepareCommitOutputSchema,
     execute: async ({ inputData, mastra, runId }): Promise<PrepareCommitOutput> => {
@@ -180,7 +180,7 @@ export const prepareCommitAndPushStep = createStep({
         const { containerId } = inputData;
 
         await notifyStepStatus({
-            stepId: "prepare-commit-and-push-step",
+            stepId: "prepareCommitStep",
             status: "starting",
             runId,
             containerId,
@@ -338,7 +338,7 @@ Do not return explanations. Only JSON.`;
         }
 
         await notifyStepStatus({
-            stepId: "prepare-commit-and-push-step",
+            stepId: "prepareCommitStep",
             status: "completed",
             runId,
             containerId,
@@ -373,7 +373,7 @@ Do not return explanations. Only JSON.`;
 // =============================================================================
 
 export const createPullRequestStep = createStep({
-    id: "create-pull-request-step",
+    id: "createPullRequestStep",
     inputSchema: CreatePullRequestInputSchema,
     outputSchema: CreatePullRequestOutputSchema,
     execute: async ({ inputData, mastra, runId }): Promise<CreatePullRequestOutput> => {
@@ -384,7 +384,7 @@ export const createPullRequestStep = createStep({
         }
 
         await notifyStepStatus({
-            stepId: "create-pull-request-step",
+            stepId: "createPullRequestStep",
             status: "starting",
             runId,
             containerId: inputData.containerId,
@@ -528,7 +528,7 @@ ${specFunctions}`,
                         const prNumberRetry = prRetry.number;
 
                     await notifyStepStatus({
-                        stepId: "create-pull-request-step",
+                        stepId: "createPullRequestStep",
                         status: "completed",
                         runId,
                         containerId: inputData.containerId,
@@ -589,7 +589,7 @@ ${specFunctions}`,
         }
 
         await notifyStepStatus({
-            stepId: "create-pull-request-step",
+            stepId: "createPullRequestStep",
             status: "completed",
             runId,
             containerId: inputData.containerId,
@@ -617,7 +617,7 @@ ${specFunctions}`,
 // =============================================================================
 
 export const postPrUrlStep = createStep({
-    id: "post-pr-url-step",
+    id: "postPrUrlStep",
     inputSchema: PostPrUrlInputSchema,
     outputSchema: PostPrUrlInputSchema,
     execute: async ({ inputData, mastra, runId }): Promise<PostPrUrlInput> => {
@@ -626,7 +626,7 @@ export const postPrUrlStep = createStep({
         const url = `${baseUrl}/api/projects/${inputData.projectId}/pr-url`;
 
         await notifyStepStatus({
-            stepId: "post-pr-url-step",
+            stepId: "postPrUrlStep",
             status: "starting",
             runId,
             containerId: inputData.containerId,
@@ -652,7 +652,7 @@ export const postPrUrlStep = createStep({
         }
 
         await notifyStepStatus({
-            stepId: "post-pr-url-step",
+            stepId: "postPrUrlStep",
             status: "completed",
             runId,
             containerId: inputData.containerId,
@@ -685,7 +685,7 @@ export const githubPrWorkflow = createWorkflow({
     inputSchema: WorkflowInputSchema,
     outputSchema: WorkflowOutputSchema,
 })
-.then(prepareCommitAndPushStep)
+.then(prepareCommitStep)
 .then(createPullRequestStep)
 .then(postPrUrlStep)
 .commit();

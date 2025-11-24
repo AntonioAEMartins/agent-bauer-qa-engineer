@@ -1,27 +1,27 @@
-
 import { Mastra } from '@mastra/core/mastra';
 import { registerApiRoute } from '@mastra/core/server';
 import { PinoLogger } from '@mastra/loggers';
 import type { LogLevel } from '@mastra/loggers';
 import { LibSQLStore } from '@mastra/libsql';
-import { dockerAgent } from './agents/docker-agent';
-import { contextAgent } from './agents/context-agent';
-import { unitTestAgent } from './agents/unit-test-agent';
-import { testAnalysisAgent } from './agents/test-analysis-agent';
-import { testSpecificationAgent } from './agents/test-specification-agent';
-import { testGenerationAgent } from './agents/test-generation-agent';
-import { testValidationAgent } from './agents/test-validation-agent';
-import { githubPrAgent } from './agents/github-pr-agent';
-import { codebaseDescriptionAgent } from './agents/codebase-description-agent';
-import { testCoveringAgent } from './agents/test-covering-agent';
-import { typescriptVitestCoverageAgent } from './agents/typescript-vitest-coverage-agent';
-// import { testManagerAgent } from './agents/test-manager-agent'; // COMMENTED OUT FOR MVP VALIDATION
-// import { testCoderAgent } from './agents/test-coder-agent'; // COMMENTED OUT FOR MVP VALIDATION
-import { testDockerWorkflow } from './workflows/test/01-docker-test-workflow';
-import { gatherContextWorkflow } from './workflows/test/02-gather-context-workflow';
-import { generateUnitTestsWorkflow } from './workflows/test/03-generate-unit-tests-workflow';
+import {
+  codebaseDescriptionAgent,
+  contextAgent,
+  dockerAgent,
+  githubPrAgent,
+  testAnalysisAgent,
+  testCoverageAgent,
+  testGenerationAgent,
+  testSpecificationAgent,
+  testValidationAgent,
+  unitTestAgent,
+  // testManagerAgent,
+  // testCoderAgent,
+} from './agents';
+import { dockerSetupWorkflow } from './workflows/test/01-docker-setup-workflow';
+import { contextGatheringWorkflow } from './workflows/test/02-context-gathering-workflow';
+import { testGenerationWorkflow } from './workflows/test/03-test-generation-workflow';
 import { githubPrWorkflow } from './workflows/test/04-github-pr-workflow';
-import { testCoverageWorkflow } from './workflows/test/05-test-coverage-workflow';
+import { coverageAnalysisWorkflow } from './workflows/test/05-coverage-analysis-workflow';
 // import { unitTestWorkflow } from './workflows/unit-test-workflow';
 import { fullPipelineWorkflow } from './workflows/full-pipeline-workflow';
 import { writeFileSync } from 'fs';
@@ -41,7 +41,7 @@ const getLogLevel = (): LogLevel => {
 };
 
 export const mastra = new Mastra({
-  workflows: { testDockerWorkflow, gatherContextWorkflow, generateUnitTestsWorkflow, githubPrWorkflow, testCoverageWorkflow, fullPipelineWorkflow },
+  workflows: { dockerSetupWorkflow, contextGatheringWorkflow, testGenerationWorkflow, githubPrWorkflow, coverageAnalysisWorkflow, fullPipelineWorkflow },
   agents: { 
     dockerAgent, 
     contextAgent, 
@@ -52,8 +52,7 @@ export const mastra = new Mastra({
     testValidationAgent,
     githubPrAgent,
     codebaseDescriptionAgent,
-    testCoveringAgent,
-    typescriptVitestCoverageAgent,
+    testCoverageAgent,
     // testManagerAgent, // COMMENTED OUT FOR MVP VALIDATION
     // testCoderAgent    // COMMENTED OUT FOR MVP VALIDATION
   },

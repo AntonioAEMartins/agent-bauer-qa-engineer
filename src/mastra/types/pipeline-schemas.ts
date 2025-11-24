@@ -33,7 +33,7 @@ export type PipelineInput = z.infer<typeof PipelineInputSchema>;
 // =============================================================================
 
 /**
- * Step 1: testDockerStep output - Container created.
+ * Step 1: dockerSetupStep output - Container created.
  */
 export const TestDockerStepOutputSchema = z.object({
     result: z.string().describe("The result of the Docker operation"),
@@ -48,7 +48,7 @@ export const TestDockerStepOutputSchema = z.object({
 export type TestDockerStepOutput = z.infer<typeof TestDockerStepOutputSchema>;
 
 /**
- * Step 2: testDockerGithubCloneStep output - Repository cloned.
+ * Step 2: githubCloneStep output - Repository cloned.
  */
 export const TestDockerGithubCloneStepOutputSchema = TestDockerStepOutputSchema.extend({
     repoPath: z.string().describe("Absolute path to the cloned repository inside the container"),
@@ -68,8 +68,8 @@ export type PostProjectStepOutput = z.infer<typeof PostProjectStepOutputSchema>;
  * Parallel output from postProjectDescriptionStep and postProjectStackStep.
  */
 export const ParallelPostProjectOutputSchema = z.object({
-    "post-project-description-step": PostProjectStepOutputSchema,
-    "post-project-stack-step": PostProjectStepOutputSchema,
+    "postProjectDescriptionStep": PostProjectStepOutputSchema,
+    "postProjectStackStep": PostProjectStepOutputSchema,
 });
 
 export type ParallelPostProjectOutput = z.infer<typeof ParallelPostProjectOutputSchema>;
@@ -233,9 +233,9 @@ export type AnalyzeBuildDeploymentStepOutput = z.infer<typeof AnalyzeBuildDeploy
  * Parallel output from analysis steps.
  */
 export const ParallelAnalysisOutputSchema = z.object({
-    "analyze-repository-step": AnalyzeRepositoryStepOutputSchema,
-    "analyze-codebase-step": AnalyzeCodebaseStepOutputSchema,
-    "analyze-build-deployment-step": AnalyzeBuildDeploymentStepOutputSchema,
+    "analyzeRepositoryStep": AnalyzeRepositoryStepOutputSchema,
+    "analyzeCodebaseStep": AnalyzeCodebaseStepOutputSchema,
+    "analyzeBuildDeploymentStep": AnalyzeBuildDeploymentStepOutputSchema,
 });
 
 export type ParallelAnalysisOutput = z.infer<typeof ParallelAnalysisOutputSchema>;
@@ -251,7 +251,7 @@ export const SynthesizeContextStepOutputSchema = RepoContextSchema.extend({
 export type SynthesizeContextStepOutput = z.infer<typeof SynthesizeContextStepOutputSchema>;
 
 /**
- * gatherSaveContextStep output.
+ * saveContextStep output.
  */
 export const GatherSaveContextStepOutputSchema = z.object({
     containerId: z.string(),
@@ -308,7 +308,7 @@ export const GenerateTestCodeStepOutputSchema = z.object({
 export type GenerateTestCodeStepOutput = z.infer<typeof GenerateTestCodeStepOutputSchema>;
 
 /**
- * finalizeStep output.
+ * finalizeTestsStep output.
  */
 export const FinalizeStepOutputSchema = UnitTestResultSchema.extend({
     projectId: z.string(),
@@ -323,7 +323,7 @@ export type FinalizeStepOutput = z.infer<typeof FinalizeStepOutputSchema>;
 // =============================================================================
 
 /**
- * prepareCommitAndPushStep output.
+ * prepareCommitStep output.
  */
 export const PrepareCommitAndPushStepOutputSchema = z.object({
     containerId: z.string(),
@@ -381,7 +381,7 @@ export type PostPrUrlStepOutput = z.infer<typeof PostPrUrlStepOutputSchema>;
 // =============================================================================
 
 /**
- * runTypescriptVitestCoverageStep output.
+ * runCoverageStep output.
  */
 export const RunTypescriptVitestCoverageStepOutputSchema = z.object({
     containerId: z.string(),
@@ -403,7 +403,7 @@ export const RunTypescriptVitestCoverageStepOutputSchema = z.object({
 export type RunTypescriptVitestCoverageStepOutput = z.infer<typeof RunTypescriptVitestCoverageStepOutputSchema>;
 
 /**
- * postTestCoverageStep output (same as input, passes through).
+ * postCoverageStep output (same as input, passes through).
  */
 export const PostTestCoverageStepOutputSchema = RunTypescriptVitestCoverageStepOutputSchema;
 

@@ -134,9 +134,9 @@ export async function notifyStepStatus(params: {
 /**
  * Convert workflow title/subtitle pairs into concise, user-friendly messages.
  * Covers the known steps from:
- * - 01-docker-test-workflow.ts
- * - 02-gather-context-workflow.ts
- * - 03-generate-unit-tests-workflow.ts
+ * - 01-docker-setup-workflow.ts
+ * - 02-context-gathering-workflow.ts
+ * - 03-test-generation-workflow.ts
  * - full-pipeline-workflow.ts
  * Falls back to a sensible join of title and subtitle when unknown.
  */

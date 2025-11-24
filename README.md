@@ -62,7 +62,7 @@ curl -X POST http://localhost:4111/start-full-pipeline \
 ## What the pipeline does
 Entry file: `src/mastra/index.ts` registers workflows and the `/start-full-pipeline` route.
 
-Workflow: `full-pipeline-workflow`
+Workflow: `fullPipelineWorkflow`
 1) Docker setup and GitHub clone
    - Builds minimal Ubuntu image, runs container, clones the target repo via `.docker.credentials`.
 2) Post project info (parallel)
@@ -81,11 +81,11 @@ Workflow: `full-pipeline-workflow`
 Key files to explore:
 - `src/mastra/index.ts`: Mastra setup, server route for `/start-full-pipeline`.
 - `src/mastra/workflows/full-pipeline-workflow.ts`: Orchestration of the end‑to‑end steps.
-- `src/mastra/workflows/test/01-docker-test-workflow.ts`: Docker build/run, GitHub clone, description/stack posting, context save.
-- `src/mastra/workflows/test/02-gather-context-workflow.ts`: Parallel repo/codebase/build analyses and synthesis.
-- `src/mastra/workflows/test/03-generate-unit-tests-workflow.ts`: MVP planning, test generation, validation/retry, finalize.
+- `src/mastra/workflows/test/01-docker-setup-workflow.ts`: Docker build/run, GitHub clone, description/stack posting, context save.
+- `src/mastra/workflows/test/02-context-gathering-workflow.ts`: Parallel repo/codebase/build analyses and synthesis.
+- `src/mastra/workflows/test/03-test-generation-workflow.ts`: MVP planning, test generation, validation/retry, finalize.
 - `src/mastra/workflows/test/04-github-pr-workflow.ts`: Branch, commit, push, open PR, post PR URL.
-- `src/mastra/workflows/test/05-test-coverage-workflow.ts`: Coverage calculation and backend POST.
+- `src/mastra/workflows/test/05-coverage-analysis-workflow.ts`: Coverage calculation and backend POST.
 
 ## Notes & tips
 - The server writes `.docker.credentials` to the project root (and a fallback `../../.docker.credentials`) containing `GITHUB_PAT=<token>`; it’s copied into the container for cloning and then removed from the container.
